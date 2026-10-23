@@ -6,6 +6,16 @@
 # IMPORTANT: download to a file before running: this self-contained installer reads its appended assets from $0.
 set -Eeuo pipefail
 trap 'echo "[ERROR] line $LINENO: deployment interrupted; inspect output above" >&2' ERR
+# Stop a package-started Nginx on early failure; do not stop configured HTTPS.
+INSTALLER_NGINX_CLEANUP=0
+installer_cleanup_on_exit() {
+  local status=$?
+  if (( status != 0 && INSTALLER_NGINX_CLEANUP == 1 )); then
+    echo '[INFO] Stopping Nginx started by this installer after failure.' >&2
+    systemctl stop nginx >/dev/null 2>&1 || true
+  fi
+}
+trap installer_cleanup_on_exit EXIT
 
 if [[ "${EUID}" -ne 0 ]]; then echo 'Run as root: sudo bash deploy.sh' >&2; exit 1; fi
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
@@ -33,35 +43,138 @@ if [[ -f /etc/telemt/telemt.toml || -e /opt/mtpr-simple/main.sh ]]; then
  echo 'Existing Telemt/MEKOPR installation detected. This installer is for a fresh VPS and will not overwrite it.' >&2
  exit 1
 fi
+# Check public DNS before installing packages. Python 3 is shipped with Ubuntu.
+for cmd in curl python3 getent ss; do
+  command -v "$cmd" >/dev/null 2>&1 || { echo "Preflight requires $cmd on Ubuntu 24.04." >&2; exit 1; }
+done
+echo '[0/8] Checking public IP and DNS before installing packages...'
+PUBLIC_IP="$(curl -4 -fsS --connect-timeout 5 --max-time 12 https://api.ipify.org)"
+if [[ ! "$PUBLIC_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+  echo 'Cannot obtain public IPv4.' >&2
+  exit 1
+fi
+DNS_IPS="$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '{print $1}' | sort -u || true)"
+if ! grep -Fxq "$PUBLIC_IP" <<< "$DNS_IPS"; then
+  echo "DNS A record for $DOMAIN must point to this VPS ($PUBLIC_IP), currently: ${DNS_IPS:-<none>}" >&2
+  exit 1
+fi
+echo "[OK] Domain $DOMAIN resolves to this VPS $PUBLIC_IP"
+
+# DNS queries over UDP without relying on the not-yet-installed dig utility.
+python3 - "$DOMAIN" "$PUBLIC_IP" <<'PY'
+import secrets
+import socket
+import struct
+import sys
+
+domain, expected_ip = sys.argv[1:]
+query_name = b''.join(bytes([len(label)]) + label.encode('ascii') for label in domain.split('.')) + b'\x00'
+
+def skip_name(packet, pos):
+    for _ in range(128):
+        if pos >= len(packet):
+            raise ValueError('Truncated DNS name')
+        length = packet[pos]
+        if length & 0xc0 == 0xc0:
+            if pos + 1 >= len(packet):
+                raise ValueError('Truncated DNS pointer')
+            return pos + 2
+        if length & 0xc0:
+            raise ValueError('Invalid DNS label')
+        pos += 1
+        if length == 0:
+            return pos
+        pos += length
+    raise ValueError('Invalid DNS name')
+
+def resolve_public(resolver):
+    request_id = secrets.randbelow(65536)
+    question = struct.pack('!HHHHHH', request_id, 0x0100, 1, 0, 0, 0) + query_name + struct.pack('!HH', 1, 1)
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.settimeout(3)
+        sock.sendto(question, (resolver, 53))
+        reply, source = sock.recvfrom(4096)
+    if source[0] != resolver or len(reply) < 12:
+        raise ValueError('Invalid DNS reply')
+    rid, flags, questions, answers, _, _ = struct.unpack_from('!HHHHHH', reply)
+    if rid != request_id or not flags & 0x8000 or flags & 0x000f:
+        raise ValueError('DNS error or mismatched response')
+    pos = 12
+    for _ in range(questions):
+        pos = skip_name(reply, pos) + 4
+    addresses = []
+    for _ in range(answers):
+        pos = skip_name(reply, pos)
+        qtype, qclass, _ttl, size = struct.unpack_from('!HHIH', reply, pos)
+        pos += 10
+        if pos + size > len(reply):
+            raise ValueError('Truncated DNS answer')
+        if qtype == 1 and qclass == 1 and size == 4:
+            addresses.append(socket.inet_ntoa(reply[pos:pos + 4]))
+        pos += size
+    return addresses
+
+failed = False
+for resolver in ('1.1.1.1', '8.8.8.8'):
+    try:
+        addresses = resolve_public(resolver)
+    except (OSError, ValueError, struct.error) as exc:
+        addresses = []
+        print(f'Public DNS @{resolver} for {domain}: error ({exc}); expected {expected_ip}.', file=sys.stderr)
+        failed = True
+        continue
+    if expected_ip not in addresses:
+        print(f'Public DNS @{resolver} for {domain}: {", ".join(addresses) or "<none>"}; expected {expected_ip}.', file=sys.stderr)
+        failed = True
+    else:
+        print(f'[OK] Public DNS @{resolver}: {expected_ip}')
+if failed:
+    sys.exit('Correct the public DNS A record and rerun; no packages have been installed by this attempt.')
+PY
+
+# Permit a retry only if port 80 belongs to an untouched Ubuntu Nginx default.
+port_occupied() {
+  local port="$1"
+  ss -lntH | awk -v p="$port" '$4 ~ (":" p "$") {found=1} END {exit !found}'
+}
+is_untouched_ubuntu_nginx() {
+  command -v dpkg >/dev/null 2>&1 || return 1
+  command -v nginx >/dev/null 2>&1 || return 1
+  systemctl is-active --quiet nginx || return 1
+  [[ -L /etc/nginx/sites-enabled/default ]] || return 1
+  [[ "$(readlink -f /etc/nginx/sites-enabled/default)" == '/etc/nginx/sites-available/default' ]] || return 1
+  [[ -z "$(find /etc/nginx/sites-enabled -mindepth 1 -maxdepth 1 ! -name default -print -quit)" ]] || return 1
+  [[ ! -d /etc/nginx/conf.d || -z "$(find /etc/nginx/conf.d -maxdepth 1 -type f -name '*.conf' -print -quit)" ]] || return 1
+  dpkg --verify nginx-common >/dev/null 2>&1 || return 1
+  ss -lntp | awk '$4 ~ /:80$/ && $0 !~ /users:\(\("nginx"/ {bad=1} END {exit bad}'
+}
+if port_occupied 80; then
+  if is_untouched_ubuntu_nginx && ! port_occupied 443; then
+    echo '[INFO] Stopping stock Ubuntu Nginx left by a previous interrupted installation.'
+    systemctl stop nginx
+  else
+    echo 'TCP port 80 is occupied by an unknown or modified service; it will not be stopped.' >&2
+    exit 1
+  fi
+fi
 for p in 80 443 9443 18080; do
-  if ss -lntH | awk -v p="$p" '$4 ~ (":" p "$") {f=1} END {exit !f}'; then
+  if port_occupied "$p"; then
     echo "TCP port $p is occupied. Do not run this installer on a non-fresh server." >&2
     exit 1
   fi
 done
 
 echo '[1/8] Installing basic dependencies...'
+INSTALLER_NGINX_CLEANUP=1
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq ca-certificates curl openssl python3 nginx certbot iproute2 dnsutils
-
-PUBLIC_IP="$(curl -4 -fsS --connect-timeout 5 --max-time 12 https://api.ipify.org)"
-if [[ ! "$PUBLIC_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then echo 'Cannot obtain public IPv4.' >&2; exit 1; fi
-DNS_IPS="$(getent ahostsv4 "$DOMAIN" | awk '{print $1}' | sort -u)"
-if ! grep -Fxq "$PUBLIC_IP" <<< "$DNS_IPS"; then
-  echo "DNS A record for $DOMAIN must point to this VPS ($PUBLIC_IP), currently: ${DNS_IPS:-<none>}" >&2
-  exit 1
+# Apt may automatically start Nginx: release :80 for Certbot and safe retries.
+if systemctl is-active --quiet nginx; then
+  echo '[INFO] Stopping Nginx auto-started by the Ubuntu package.'
+  systemctl stop nginx
 fi
-echo "[OK] Domain $DOMAIN resolves to this VPS $PUBLIC_IP"
-# ACME uses public DNS. Fail early if public resolvers still see NXDOMAIN.
-for resolver in 1.1.1.1 8.8.8.8; do
-  public_dns_ips="$(dig +time=3 +tries=1 +short @"$resolver" "$DOMAIN" A 2>/dev/null || true)"
-  if ! grep -Fxq "$PUBLIC_IP" <<< "$public_dns_ips"; then
-    echo "Public DNS @$resolver for $DOMAIN: ${public_dns_ips:-<none>}; expected $PUBLIC_IP." >&2
-    echo 'Correct the public DNS A record and rerun on a fresh VPS. No Telemt changes have been made yet.' >&2
-    exit 1
-  fi
-done
+
 # Open only required TCP ports if UFW is already active; never enable or reset it.
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -q '^Status: active'; then
   ufw allow 80/tcp
@@ -297,6 +410,8 @@ nginx -t
 systemctl reset-failed nginx || true
 systemctl enable --now nginx
 systemctl is-active --quiet nginx || { echo 'Nginx failed to start.' >&2; exit 1; }
+# Our HTTPS site is configured; preserve it even if a later check fails.
+INSTALLER_NGINX_CLEANUP=0
 
 echo '[7/8] Restarting Telemt to load the static-directory snapshot...'
 systemctl enable telemt
