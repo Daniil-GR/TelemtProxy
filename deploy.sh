@@ -300,17 +300,54 @@ systemctl is-active --quiet nginx || { echo 'Nginx failed to start.' >&2; exit 1
 
 echo '[7/8] Restarting Telemt to load the static-directory snapshot...'
 systemctl enable telemt
-systemctl restart telemt
-systemctl is-active --quiet telemt || { journalctl -u telemt -n 30 --no-pager; exit 1; }
+if ! systemctl restart telemt; then
+  echo '[ERROR] Failed to restart Telemt.' >&2
+  systemctl status telemt --no-pager --full -n 25 >&2 || true
+  journalctl -u telemt -n 60 --no-pager >&2 || true
+  exit 1
+fi
+
+echo '[7/8] Waiting up to 30 seconds for Telemt WEB HTTP readiness...'
+telemt_web_ready=0
+telemt_web_deadline=$((SECONDS + 30))
+while (( SECONDS < telemt_web_deadline )); do
+  if telemt_web_body="$(curl -4 -fsS --noproxy '*' --connect-timeout 1 --max-time 3 \
+      -H "Host: $DOMAIN" -H 'X-Forwarded-For: 127.0.0.1' \
+      'http://127.0.0.1:18080/' 2>/dev/null)" \
+      && [[ "$telemt_web_body" == *'game.js?v='* && "$telemt_web_body" == *'<title>'* ]]; then
+    telemt_web_ready=1
+    break
+  fi
+  sleep 1
+done
+
+if (( telemt_web_ready != 1 )); then
+  echo '[ERROR] Telemt WEB endpoint did not return HTTP 200 with the expected site within 30 seconds.' >&2
+  echo '[DIAG] Telemt service status:' >&2
+  systemctl status telemt --no-pager --full -n 25 >&2 || true
+  echo '[DIAG] Recent Telemt journal:' >&2
+  journalctl -u telemt -n 60 --no-pager >&2 || true
+  echo '[DIAG] Local listeners:' >&2
+  ss -lntp | grep -E ':(443|9443|18080)\b' >&2 || true
+  exit 1
+fi
+
+echo '[OK] Telemt WEB listener is ready: direct HTTP 200 with expected site.'
 ss -lntp | grep -E ':(443|9443|18080)\b' || true
 
 echo '[8/8] HTTP + certificate + asset checks...'
-ROOT="$(curl -4 -fsS --connect-timeout 5 --max-time 15 --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/")"
+if ! ROOT="$(curl -4 -fsS --noproxy '*' --connect-timeout 5 --max-time 15 \
+    --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/")"; then
+  echo '[ERROR] Local HTTPS request through Nginx failed.' >&2
+  tail -n 30 /var/log/nginx/error.log >&2 || true
+  journalctl -u telemt -n 60 --no-pager >&2 || true
+  exit 1
+fi
 if [[ "$ROOT" != *'game.js?v='* || "$ROOT" != *'<title>'* ]]; then
  echo 'Unexpected WEB response: website not loaded.' >&2; exit 1
 fi
-curl -4 -fsS --connect-timeout 5 --max-time 15 --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/game.js" -o /dev/null
-curl -4 -fsS --connect-timeout 5 --max-time 15 --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/style.css" -o /dev/null
+curl -4 -fsS --noproxy '*' --connect-timeout 5 --max-time 15 --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/game.js" -o /dev/null
+curl -4 -fsS --noproxy '*' --connect-timeout 5 --max-time 15 --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/style.css" -o /dev/null
 cat <<EOF
 
 ====================== READY ======================
