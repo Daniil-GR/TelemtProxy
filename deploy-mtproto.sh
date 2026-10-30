@@ -87,8 +87,50 @@ if (( MATCHED == 0 )); then
 fi
 echo "[OK] $DOMAIN resolves to this VPS (including assigned Floating IPs)."
 
+echo '[2/5] Selecting hello secret and sponsor ad_tag...'
+# Read credentials from the controlling terminal rather than command-line arguments,
+# so reused secrets do not end up in shell history or process arguments.
+SECRET=""
+AD_TAG=""
+if { : </dev/tty; } 2>/dev/null; then
+  echo 'Для переноса прокси со старого VPS введи прежний HEX-секрет hello и ad_tag.'
+  echo 'Оставь секрет пустым для генерации нового. Оставь ad_tag пустым без спонсорского канала.'
+  if ! read -r -s -p 'Секрет hello (32 HEX, Enter = создать новый): ' SECRET </dev/tty; then
+    echo 'Failed to read hello secret.' >&2
+    exit 1
+  fi
+  printf '\n'
+  if ! read -r -s -p 'ad_tag (32 HEX, Enter = без тега): ' AD_TAG </dev/tty; then
+    echo 'Failed to read ad_tag.' >&2
+    exit 1
+  fi
+  printf '\n'
+else
+  echo '[INFO] No interactive terminal: generating a new hello secret, ad_tag remains empty.'
+fi
+if [[ -z "$SECRET" ]]; then
+  SECRET="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+  echo '[OK] Generated a new hello secret.'
+else
+  if [[ ! "$SECRET" =~ ^[[:xdigit:]]{32}$ ]]; then
+    echo '[ERROR] hello secret must contain exactly 32 hexadecimal characters (without dd/ee).' >&2
+    exit 1
+  fi
+  SECRET="${SECRET,,}"
+  echo '[OK] Reusing the supplied hello secret.'
+fi
+if [[ -n "$AD_TAG" ]]; then
+  if [[ ! "$AD_TAG" =~ ^[[:xdigit:]]{32}$ ]]; then
+    echo '[ERROR] ad_tag must contain exactly 32 hexadecimal characters.' >&2
+    exit 1
+  fi
+  AD_TAG="${AD_TAG,,}"
+  echo '[OK] Reusing the supplied ad_tag.'
+else
+  echo '[INFO] No sponsor ad_tag selected.'
+fi
+
 echo '[2/5] Installing Telemt (latest stable) and MEKOPR SYN FIX v3...'
-SECRET="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
 TEMP_INSTALLER="$(mktemp)"
 curl -fsSL --retry 3 --max-time 30 \
   https://raw.githubusercontent.com/Mekotofeuka/MTPROTO_FIX_By_MEKO/main/install.sh \
@@ -108,7 +150,7 @@ cp -a /etc/telemt/telemt.toml "/etc/telemt/telemt.toml.bak.$(date +%s)"
 cat > /etc/telemt/telemt.toml <<EOF
 [general]
 use_middle_proxy = true
-ad_tag = ""
+ad_tag = "$AD_TAG"
 
 [general.modes]
 classic = false
@@ -143,18 +185,20 @@ hello = "$SECRET"
 EOF
 chown root:telemt /etc/telemt/telemt.toml
 chmod 640 /etc/telemt/telemt.toml
-python3 - "$DOMAIN" "$SECRET" <<'PY'
-import sys, tomllib
+python3 - "$DOMAIN" <<'PY'
+import re, sys, tomllib
 with open('/etc/telemt/telemt.toml', 'rb') as fp:
     config = tomllib.load(fp)
 assert config['general']['links']['public_host'] == sys.argv[1]
 assert config['general']['modes']['tls'] is True
 assert config['general']['modes']['secure'] is False
 assert config['censorship']['tls_domain'] == 'www.booking.com'
-assert config['access']['users'] == {'hello': sys.argv[2]}
+assert list(config['access']['users']) == ['hello']
+assert re.fullmatch(r'[0-9a-f]{32}', config['access']['users']['hello'])
+assert config['general']['ad_tag'] == '' or re.fullmatch(r'[0-9a-f]{32}', config['general']['ad_tag'])
 assert config['server']['port'] == 443
 assert 'web' not in config
-print('[OK] Minimal FakeTLS configuration validated.')
+print('[OK] Minimal FakeTLS configuration and credentials validated.')
 PY
 
 if command -v ufw >/dev/null 2>&1 && ufw status | grep -q '^Status: active'; then
@@ -206,5 +250,7 @@ MEKOPR:       mekopr
 =========================================================
 Note: this is MTProto (tg://proxy), not WEB (tg://webproxy).
 No Nginx, Certbot or WEB listener was configured.
-For sponsored channels, set ad_tag in [general] after @MTProxybot registration.
+Sponsor ad_tag: ${AD_TAG:-not set}
+To preserve the same public Telegram link after an IPv4 change,
+reuse the previous hello secret and domain (and keep port/SNI unchanged).
 EOF
