@@ -21,16 +21,81 @@ if [[ "$EUID" -ne 0 ]]; then
   echo 'Run as root: sudo bash deploy-mtproto.sh [proxy.example.org]' >&2
   exit 1
 fi
-if [[ "${1:-}" == '--help' || "${1:-}" == '-h' ]]; then
-  echo 'Usage: sudo bash deploy-mtproto.sh [public-proxy-domain]'
-  echo 'Installs MTProto only: TCP 443, user hello, FakeTLS www.booking.com.'
-  exit 0
-fi
+usage() {
+  cat <<'USAGE'
+Usage: sudo bash deploy-mtproto.sh [DOMAIN] [OPTIONS]
 
-DOMAIN="${1:-}"
+Options:
+  --domain FQDN         Domain for public tg://proxy link (or positional DOMAIN)
+  --hello HEX           Reuse existing hello secret (exactly 32 HEX characters)
+  --hello-secret HEX    Same as --hello
+  --ad-tag HEX          Sponsor tag from @MTProxybot (exactly 32 HEX characters)
+  -h, --help            Show this message
+
+Missing credentials are requested securely on a terminal.
+Empty hello input generates a new secret; empty ad_tag leaves it disabled.
+Command-line secrets may be visible in shell history and process listings.
+USAGE
+}
+
+DOMAIN=""
+SECRET=""
+AD_TAG=""
+HELLO_FLAG_SET=0
+AD_TAG_FLAG_SET=0
+
+while (($# > 0)); do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --domain|--hello|--hello-secret|--ad-tag)
+      option="$1"
+      if (($# < 2)); then
+        echo "Missing value for $option" >&2
+        exit 1
+      fi
+      value="$2"
+      case "$option" in
+        --domain)
+          if [[ -n "$DOMAIN" ]]; then echo 'Domain specified more than once.' >&2; exit 1; fi
+          DOMAIN="$value"
+          ;;
+        --hello|--hello-secret)
+          if ((HELLO_FLAG_SET)); then echo 'hello secret specified more than once.' >&2; exit 1; fi
+          if [[ -z "$value" ]]; then echo 'Empty hello flag is invalid; omit it for generation.' >&2; exit 1; fi
+          SECRET="$value"
+          HELLO_FLAG_SET=1
+          ;;
+        --ad-tag)
+          if ((AD_TAG_FLAG_SET)); then echo 'ad_tag specified more than once.' >&2; exit 1; fi
+          if [[ -z "$value" ]]; then echo 'Empty ad_tag flag is invalid; omit it for no tag.' >&2; exit 1; fi
+          AD_TAG="$value"
+          AD_TAG_FLAG_SET=1
+          ;;
+      esac
+      shift 2
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+    *)
+      if [[ -n "$DOMAIN" ]]; then
+        echo 'Domain specified more than once.' >&2
+        exit 1
+      fi
+      DOMAIN="$1"
+      shift
+      ;;
+  esac
+done
+
 if [[ -z "$DOMAIN" ]]; then
   if [[ ! -r /dev/tty ]]; then
-    echo 'Specify a domain as the first argument when no terminal is available.' >&2
+    echo 'Specify a domain via --domain FQDN or positional argument.' >&2
     exit 1
   fi
   read -r -p 'Введите домен для MTProto-ссылки (например, lt.example.org): ' DOMAIN </dev/tty
@@ -88,25 +153,31 @@ fi
 echo "[OK] $DOMAIN resolves to this VPS (including assigned Floating IPs)."
 
 echo '[2/5] Selecting hello secret and sponsor ad_tag...'
-# Read credentials from the controlling terminal rather than command-line arguments,
-# so reused secrets do not end up in shell history or process arguments.
-SECRET=""
-AD_TAG=""
+# Provided CLI values take priority. Read only missing credentials from the
+# terminal, and never echo them. Avoid putting reusable secrets on the CLI
+# when shell history/process-list exposure is a concern.
 if { : </dev/tty; } 2>/dev/null; then
-  echo 'Для переноса прокси со старого VPS введи прежний HEX-секрет hello и ad_tag.'
-  echo 'Оставь секрет пустым для генерации нового. Оставь ad_tag пустым без спонсорского канала.'
-  if ! read -r -s -p 'Секрет hello (32 HEX, Enter = создать новый): ' SECRET </dev/tty; then
-    echo 'Failed to read hello secret.' >&2
-    exit 1
+  if ((HELLO_FLAG_SET == 0)); then
+    if ! read -r -s -p 'Секрет hello (32 HEX, Enter = создать новый): ' SECRET </dev/tty; then
+      echo 'Failed to read hello secret.' >&2
+      exit 1
+    fi
+    printf '\n'
   fi
-  printf '\n'
-  if ! read -r -s -p 'ad_tag (32 HEX, Enter = без тега): ' AD_TAG </dev/tty; then
-    echo 'Failed to read ad_tag.' >&2
-    exit 1
+  if ((AD_TAG_FLAG_SET == 0)); then
+    if ! read -r -s -p 'ad_tag (32 HEX, Enter = без тега): ' AD_TAG </dev/tty; then
+      echo 'Failed to read ad_tag.' >&2
+      exit 1
+    fi
+    printf '\n'
   fi
-  printf '\n'
 else
-  echo '[INFO] No interactive terminal: generating a new hello secret, ad_tag remains empty.'
+  if ((HELLO_FLAG_SET == 0)); then
+    echo '[INFO] No terminal or --hello flag: generating a new secret.'
+  fi
+  if ((AD_TAG_FLAG_SET == 0)); then
+    echo '[INFO] No terminal or --ad-tag flag: leaving sponsor tag empty.'
+  fi
 fi
 if [[ -z "$SECRET" ]]; then
   SECRET="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
