@@ -18,12 +18,29 @@ installer_cleanup_on_exit() {
 trap installer_cleanup_on_exit EXIT
 
 if [[ "${EUID}" -ne 0 ]]; then echo 'Run as root: sudo bash deploy.sh' >&2; exit 1; fi
-if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
-  echo 'Usage: sudo bash deploy.sh [domain.example.org]'
-  echo 'If no domain is supplied, the installer prompts for a domain.'
-  exit 0
+DOMAIN=""
+CDN_MODE=0
+ORIGIN_CERT=""
+ORIGIN_KEY=""
+while (( $# )); do
+  case "$1" in
+    --cdn) CDN_MODE=1; shift ;;
+    --origin-cert|--origin-key)
+      [[ $# -ge 2 && "$2" != --* ]] || { echo "Missing file path for $1" >&2; exit 1; }
+      if [[ "$1" == --origin-cert ]]; then ORIGIN_CERT="$2"; else ORIGIN_KEY="$2"; fi
+      shift 2 ;;
+    --help|-h)
+      echo 'Usage: sudo bash deploy.sh [domain.example.org] [--cdn --origin-cert /secure/fullchain.pem --origin-key /secure/privkey.pem]'
+      echo 'Direct mode requires DNS pointing to this VPS and issues a certificate on port 80.'
+      echo 'CDN mode requires public DNS plus an existing valid origin certificate/key; it does not issue or renew them.'
+      exit 0 ;;
+    --*) echo "Unknown option: $1" >&2; exit 1 ;;
+    *) [[ -z "$DOMAIN" ]] || { echo 'Only one domain is allowed.' >&2; exit 1; }; DOMAIN="$1"; shift ;;
+  esac
+done
+if (( CDN_MODE == 0 )) && [[ -n "$ORIGIN_CERT$ORIGIN_KEY" ]]; then
+  echo 'Origin certificate flags require --cdn.' >&2; exit 1
 fi
-DOMAIN="${1:-}"
 if [[ -z "$DOMAIN" ]]; then
   if [[ ! -r /dev/tty ]]; then
     echo 'No terminal available. Pass the domain as the first argument.' >&2
@@ -43,6 +60,31 @@ if [[ -f /etc/telemt/telemt.toml || -e /opt/mtpr-simple/main.sh ]]; then
  echo 'Existing Telemt/MEKOPR installation detected. This installer is for a fresh VPS and will not overwrite it.' >&2
  exit 1
 fi
+if (( CDN_MODE == 1 )); then
+  # The CDN certificate and the origin certificate are separate. Never skip TLS
+  # verification or silently stop a live service to work around CDN DNS.
+  [[ -n "$ORIGIN_CERT" && -n "$ORIGIN_KEY" && -s "$ORIGIN_CERT" && -s "$ORIGIN_KEY" ]] || {
+    echo 'CDN mode requires --origin-cert and --origin-key from secure storage. No packages installed.' >&2; exit 1;
+  }
+  command -v openssl >/dev/null || { echo 'OpenSSL is required for origin certificate preflight.' >&2; exit 1; }
+  python3 - "$ORIGIN_KEY" <<'PY'
+import os, stat, sys
+s = os.stat(sys.argv[1])
+if not stat.S_ISREG(s.st_mode) or s.st_uid != 0 or s.st_mode & 0o077:
+    sys.exit('Origin private key must be a root-owned regular file with mode 600 or stricter.')
+PY
+  openssl x509 -in "$ORIGIN_CERT" -noout -checkhost "$DOMAIN" >/dev/null 2>&1 || { echo 'Origin certificate does not cover the domain.' >&2; exit 1; }
+  openssl x509 -in "$ORIGIN_CERT" -noout -checkend 86400 >/dev/null 2>&1 || { echo 'Origin certificate expires within 24 hours.' >&2; exit 1; }
+  ORIGIN_LEAF="$(mktemp)"
+  openssl x509 -in "$ORIGIN_CERT" -out "$ORIGIN_LEAF"
+  if ! openssl verify -untrusted "$ORIGIN_CERT" "$ORIGIN_LEAF" >/dev/null 2>&1; then
+    rm -f "$ORIGIN_LEAF"; echo 'Origin certificate chain is not trusted or not yet valid.' >&2; exit 1
+  fi
+  rm -f "$ORIGIN_LEAF"
+  CERT_PUBLIC="$(openssl x509 -in "$ORIGIN_CERT" -pubkey -noout | openssl pkey -pubin -outform DER | openssl dgst -sha256)"
+  KEY_PUBLIC="$(openssl pkey -in "$ORIGIN_KEY" -passin pass: -pubout -outform DER 2>/dev/null | openssl dgst -sha256)"
+  [[ "$CERT_PUBLIC" == "$KEY_PUBLIC" ]] || { echo 'Origin certificate/key mismatch.' >&2; exit 1; }
+fi
 # Check public DNS before installing packages. Python 3 is shipped with Ubuntu.
 for cmd in curl python3 getent ss; do
   command -v "$cmd" >/dev/null 2>&1 || { echo "Preflight requires $cmd on Ubuntu 24.04." >&2; exit 1; }
@@ -54,20 +96,26 @@ if [[ ! "$PUBLIC_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
   exit 1
 fi
 DNS_IPS="$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '{print $1}' | sort -u || true)"
-if ! grep -Fxq "$PUBLIC_IP" <<< "$DNS_IPS"; then
+if (( CDN_MODE == 0 )) && ! grep -Fxq "$PUBLIC_IP" <<< "$DNS_IPS"; then
   echo "DNS A record for $DOMAIN must point to this VPS ($PUBLIC_IP), currently: ${DNS_IPS:-<none>}" >&2
   exit 1
 fi
-echo "[OK] Domain $DOMAIN resolves to this VPS $PUBLIC_IP"
+if (( CDN_MODE == 1 )); then
+  [[ -n "$DNS_IPS" ]] || { echo 'CDN domain has no IPv4 DNS answer.' >&2; exit 1; }
+  echo "[OK] CDN domain resolves; DNS is not required to match origin $PUBLIC_IP."
+else
+  echo "[OK] Domain $DOMAIN resolves to this VPS $PUBLIC_IP"
+fi
 
 # DNS queries over UDP without relying on the not-yet-installed dig utility.
-python3 - "$DOMAIN" "$PUBLIC_IP" <<'PY'
+python3 - "$DOMAIN" "$PUBLIC_IP" "$CDN_MODE" <<'PY'
+import ipaddress
 import secrets
 import socket
 import struct
 import sys
 
-domain, expected_ip = sys.argv[1:]
+domain, expected_ip, cdn_mode = sys.argv[1:]
 query_name = b''.join(bytes([len(label)]) + label.encode('ascii') for label in domain.split('.')) + b'\x00'
 
 def skip_name(packet, pos):
@@ -123,13 +171,14 @@ for resolver in ('1.1.1.1', '8.8.8.8'):
         print(f'Public DNS @{resolver} for {domain}: error ({exc}); expected {expected_ip}.', file=sys.stderr)
         failed = True
         continue
-    if expected_ip not in addresses:
+    valid = bool(addresses) and all(ipaddress.ip_address(ip).is_global for ip in addresses) if cdn_mode == '1' else expected_ip in addresses
+    if not valid:
         print(f'Public DNS @{resolver} for {domain}: {", ".join(addresses) or "<none>"}; expected {expected_ip}.', file=sys.stderr)
         failed = True
     else:
-        print(f'[OK] Public DNS @{resolver}: {expected_ip}')
+        print(f'[OK] Public DNS @{resolver}: {", ".join(addresses)}')
 if failed:
-    sys.exit('Correct the public DNS A record and rerun; no packages have been installed by this attempt.')
+    sys.exit('Correct public DNS and rerun; no packages have been installed by this attempt.')
 PY
 
 # Permit a retry only if port 80 belongs to an untouched Ubuntu Nginx default.
@@ -360,6 +409,14 @@ PY
 rm -f "$SITE_ZIP"
 
 echo '[5/8] Obtaining TLS certificate (port 80 must be reachable from Internet)...'
+if (( CDN_MODE == 1 )); then
+  echo '[INFO] Using supplied origin certificate; CDN client certificate is managed in Gcore separately.'
+  install -d -m 700 /etc/telemtproxy/origin
+  install -m 600 "$ORIGIN_CERT" /etc/telemtproxy/origin/fullchain.pem
+  install -m 600 "$ORIGIN_KEY" /etc/telemtproxy/origin/privkey.pem
+  TLS_CERT_PATH=/etc/telemtproxy/origin/fullchain.pem
+  TLS_KEY_PATH=/etc/telemtproxy/origin/privkey.pem
+else
 systemctl stop nginx || true
 if ss -lntH | awk '$4 ~ /:80$/ {f=1} END {exit !f}'; then
     echo 'Port 80 is still occupied; certbot standalone needs port 80.' >&2; exit 1
@@ -367,8 +424,11 @@ fi
 certbot certonly --standalone --preferred-challenges http -d "$DOMAIN" \
   --non-interactive --agree-tos --register-unsafely-without-email \
   --keep-until-expiring
+TLS_CERT_PATH="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+TLS_KEY_PATH="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+fi
 
-if [[ ! -s "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" || ! -s "/etc/letsencrypt/live/$DOMAIN/privkey.pem" ]]; then
+if [[ ! -s "$TLS_CERT_PATH" || ! -s "$TLS_KEY_PATH" ]]; then
  echo 'TLS certificate not found.' >&2; exit 1
 fi
 
@@ -385,8 +445,8 @@ upstream telemt_web {
 server {
     listen 443 ssl http2;
     server_name $DOMAIN;
-    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
+    ssl_certificate $TLS_CERT_PATH;
+    ssl_certificate_key $TLS_KEY_PATH;
     client_max_body_size 2m;
     access_log off;
     location / {
@@ -450,6 +510,10 @@ fi
 echo '[OK] Telemt WEB listener is ready: direct HTTP 200 with expected site.'
 ss -lntp | grep -E ':(443|9443|18080)\b' || true
 
+if (( CDN_MODE == 1 )); then
+  echo '[INFO] Renew the origin certificate through secure automation before it expires; this installer does not renew supplied files.'
+  echo '[INFO] Configure CDN HTTPS origin, original Host forwarding, disabled caching, and long-poll timeouts.'
+fi
 echo '[8/8] HTTP + certificate + asset checks...'
 if ! ROOT="$(curl -4 -fsS --noproxy '*' --connect-timeout 5 --max-time 15 \
     --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/")"; then
