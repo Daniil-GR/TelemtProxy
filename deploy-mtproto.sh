@@ -6,8 +6,20 @@ set -Eeuo pipefail
 PORT=443
 MASK_DOMAIN="www.booking.com"
 TEMP_INSTALLER=""
+TEMP_EDGE_HELPER=""
+TEMP_EDGE_CIDRS=""
+EDGE_MODE=0
+EDGE_OWNED_INSTALL=0
 cleanup() {
+  local status=$?
+  if (( status != 0 && EDGE_MODE == 1 && EDGE_OWNED_INSTALL == 1 )); then
+    systemctl disable --now telemt-gcore-refresh.timer >/dev/null 2>&1 || true
+    systemctl stop telemt >/dev/null 2>&1 || true
+    echo '[ERROR] Fresh Edge Telemt stopped after installation failure; SSH and routing are unchanged.' >&2
+  fi
   if [[ -n "$TEMP_INSTALLER" ]]; then rm -f "$TEMP_INSTALLER"; fi
+  if [[ -n "$TEMP_EDGE_HELPER" ]]; then rm -f "$TEMP_EDGE_HELPER"; fi
+  if [[ -n "$TEMP_EDGE_CIDRS" ]]; then rm -f "$TEMP_EDGE_CIDRS"; fi
 }
 on_error() {
   local code=$?
@@ -17,15 +29,12 @@ on_error() {
 trap cleanup EXIT
 trap 'on_error "$LINENO"' ERR
 
-if [[ "$EUID" -ne 0 ]]; then
-  echo 'Run as root: sudo bash deploy-mtproto.sh [proxy.example.org]' >&2
-  exit 1
-fi
 usage() {
   cat <<'USAGE'
 Usage: sudo bash deploy-mtproto.sh [DOMAIN] [OPTIONS]
 
 Options:
+  --edge-proxy          MTProto for Gcore Edge Proxy (TCP 443, PROXY protocol v1/v2)
   --domain FQDN         Domain for public tg://proxy link (or positional DOMAIN)
   --hello HEX           Reuse existing hello secret (exactly 32 HEX characters)
   --hello-secret HEX    Same as --hello
@@ -49,6 +58,10 @@ while (($# > 0)); do
     -h|--help)
       usage
       exit 0
+      ;;
+    --edge-proxy)
+      EDGE_MODE=1
+      shift
       ;;
     --domain|--hello|--hello-secret|--ad-tag)
       option="$1"
@@ -93,6 +106,11 @@ while (($# > 0)); do
   esac
 done
 
+if [[ "$EUID" -ne 0 ]]; then
+  echo 'Run as root: sudo bash deploy-mtproto.sh [proxy.example.org]' >&2
+  exit 1
+fi
+
 if [[ -z "$DOMAIN" ]]; then
   if [[ ! -r /dev/tty ]]; then
     echo 'Specify a domain via --domain FQDN or positional argument.' >&2
@@ -130,6 +148,27 @@ if ss -lntH | awk -v port="$PORT" '$4 ~ (":" port "$") {found=1} END {exit !foun
   exit 1
 fi
 
+if (( EDGE_MODE == 1 )); then
+  echo '[1/5] Preparing Gcore Edge mode (public DNS may point to Edge IP or be absent)...'
+  for path in /etc/telemt/gcore-edge-cidrs.json /usr/local/lib/telemtproxy/gcore-edge.py /etc/systemd/system/telemt-gcore-firewall.service; do
+    [[ ! -e "$path" ]] || { echo "Existing Edge setup: $path. Use a fresh VPS." >&2; exit 1; }
+  done
+  TEMP_EDGE_HELPER="$(mktemp)"
+  TEMP_EDGE_CIDRS="$(mktemp)"
+  curl -fsSL --retry 3 --max-time 30 https://raw.githubusercontent.com/Daniil-GR/TelemtProxy/main/gcore-edge.py -o "$TEMP_EDGE_HELPER"
+  EXPECTED_EDGE_SHA256="e278c2418af4a04baa86925387c22751981084d27477219439415fe167fa8034"
+  [[ "$(sha256sum "$TEMP_EDGE_HELPER" | awk '{print $1}')" == "$EXPECTED_EDGE_SHA256" ]] || {
+    echo 'Edge helper checksum mismatch. Download the current installer again.' >&2; exit 1;
+  }
+  python3 "$TEMP_EDGE_HELPER" fetch > "$TEMP_EDGE_CIDRS"
+  PUBLIC_IP="$(curl -4 -fsS --connect-timeout 5 --max-time 12 https://api.ipify.org)"
+  python3 - "$PUBLIC_IP" <<'IP_CHECK'
+import ipaddress, sys
+ip = ipaddress.ip_address(sys.argv[1])
+assert ip.version == 4 and ip.is_global
+IP_CHECK
+  echo '[OK] Official Gcore network list validated. No API token required.'
+else
 echo '[1/5] Checking domain resolution...'
 PUBLIC_IP="$(curl -4 -fsS --connect-timeout 5 --max-time 12 https://api.ipify.org)"
 DNS_IPS="$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '{print $1}' | sort -u || true)"
@@ -151,6 +190,8 @@ if (( MATCHED == 0 )); then
   exit 1
 fi
 echo "[OK] $DOMAIN resolves to this VPS (including assigned Floating IPs)."
+
+fi
 
 echo '[2/5] Selecting hello secret and sponsor ad_tag...'
 # Provided CLI values take priority. Read only missing credentials from the
@@ -201,14 +242,24 @@ else
   echo '[INFO] No sponsor ad_tag selected.'
 fi
 
-echo '[2/5] Installing Telemt (latest stable) and MEKOPR SYN FIX v3...'
+if (( EDGE_MODE == 1 )); then
+  echo '[2/5] Installing Telemt for Gcore (without direct-client SYN FIX)...'
+  FIX_ARGS=(-no-fix)
+  command -v apt-get >/dev/null || { echo 'apt-get is required.' >&2; exit 1; }
+  DEBIAN_FRONTEND=noninteractive apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y iptables ipset
+else
+  echo '[2/5] Installing Telemt (latest stable) and MEKOPR SYN FIX v3...'
+  FIX_ARGS=(-fix -fix-type v3)
+fi
 TEMP_INSTALLER="$(mktemp)"
 curl -fsSL --retry 3 --max-time 30 \
   https://raw.githubusercontent.com/Mekotofeuka/MTPROTO_FIX_By_MEKO/main/install.sh \
   -o "$TEMP_INSTALLER"
 # Upstream may print temporary proxy links. The final configuration below replaces them.
+if (( EDGE_MODE == 1 )); then EDGE_OWNED_INSTALL=1; fi
 bash "$TEMP_INSTALLER" -telemt -domain "$MASK_DOMAIN" -port "$PORT" \
-  -version latest -fix -fix-type v3
+  -version latest "${FIX_ARGS[@]}"
 rm -f "$TEMP_INSTALLER"
 TEMP_INSTALLER=""
 
@@ -272,7 +323,11 @@ assert 'web' not in config
 print('[OK] Minimal FakeTLS configuration and credentials validated.')
 PY
 
-if command -v ufw >/dev/null 2>&1 && ufw status | grep -q '^Status: active'; then
+if (( EDGE_MODE == 1 )); then
+  python3 "$TEMP_EDGE_HELPER" install --cidrs-file "$TEMP_EDGE_CIDRS"
+fi
+
+if (( EDGE_MODE == 0 )) && command -v ufw >/dev/null 2>&1 && ufw status | grep -q '^Status: active'; then
   ufw allow "$PORT/tcp"
 fi
 
@@ -300,6 +355,10 @@ if (( READY == 0 )); then
 fi
 echo '[OK] Telemt service active and TCP 443 is listening.'
 
+if (( EDGE_MODE == 1 )); then
+  echo '[OK] Gcore Edge configuration ready. Full Telegram data transfer must be checked through an active Gcore mapping.'
+fi
+
 echo '[5/5] Generating domain-based Telegram link...'
 MASK_HEX="$(printf '%s' "$MASK_DOMAIN" | od -An -tx1 | tr -d ' \n')"
 LINK="tg://proxy?server=$DOMAIN&port=$PORT&secret=ee$SECRET$MASK_HEX"
@@ -325,3 +384,22 @@ Sponsor ad_tag: ${AD_TAG:-not set}
 To preserve the same public Telegram link after an IPv4 change,
 reuse the previous hello secret and domain (and keep port/SNI unchanged).
 EOF
+
+if (( EDGE_MODE == 1 )); then
+  cat <<EOF
+
+================== MTPROTO ДЛЯ EDGE PROXY ==================
+Origin VPS: $PUBLIC_IP:443 (TCP)
+В Gcore: Generic TCP Server, порт 443/TCP, PROXY protocol V1 (или V2).
+После активации укажите выданный Edge IP в A-записи $DOMAIN.
+Прямые подключения к VPS:443 запрещены, разрешены только адреса Gcore.
+Собственный TLS-сертификат, Nginx и HTTP CDN здесь не нужны.
+Сети Gcore обновляются каждые 10 минут; при изменении выполняется
+короткий перезапуск Telemt с откатом конфигурации при ошибке.
+Журнал: journalctl -u telemt-gcore-refresh.service -u telemt-gcore-firewall.service
+Проверка: systemctl status telemt telemt-gcore-refresh.timer
+Готовность порта не подтверждает передачу данных: проверьте сообщения
+и фотографии в Telegram через Edge IP после настройки Gcore и DNS.
+============================================================
+EOF
+fi

@@ -1,6 +1,6 @@
 # TelemtProxy
 
-Два независимых установщика Telemt для чистого Ubuntu 24.04 VPS: WEB + MTProto и облегчённый вариант только MTProto.
+Установка Telemt на чистый Ubuntu 24.04 VPS: WEB + MTProto, только MTProto и MTProto для Gcore Edge Proxy.
 
 Основной `deploy.sh` устанавливает WEB + MTProto, MEKOPR, Nginx и сертификат Let's Encrypt, а также создаёт игровую заглушку. Отдельный `deploy-mtproto.sh` устанавливает только MTProto/FakeTLS, без WEB-режима и веб-сервера.
 
@@ -83,6 +83,75 @@ sudo cat /root/telemt-mtproto-link.txt
 ~~~
 
 Установщик предназначен для **чистого VPS**: он не перезаписывает действующие конфигурации Telemt/MEKOPR и не занимает чужой порт 443. Для Floating IP DNS A-запись должна указывать на адрес интерфейса VPS либо на определяемый внешний IPv4.
+
+## MTProto для Edge Proxy (Gcore)
+
+Используется тот же `deploy-mtproto.sh`, с отдельным режимом `--edge-proxy`.
+Запускайте **только на новом Ubuntu 24.04 VPS**. Существующий Telemt установщик
+не перезаписывает. WEB/CDN и обычный MTProto продолжают использовать прежние команды.
+
+```bash
+curl -fsSLo /tmp/telemt-mtproto.sh https://raw.githubusercontent.com/Daniil-GR/TelemtProxy/main/deploy-mtproto.sh
+sudo bash /tmp/telemt-mtproto.sh --edge-proxy edge.example.org
+```
+
+Вместо `edge.example.org` укажите будущий клиентский поддомен. Домен можно не
+передавать — установщик спросит его. Предварительная A-запись на IP VPS не нужна:
+домен позже будет указывать на **Edge IP Gcore**. Для секрета `hello` нажмите Enter,
+чтобы создать новый; новый `ad_tag` вводится скрыто или оставляется пустым. Старые
+секреты/теги не копируются. Ссылка сохраняется в `/root/telemt-mtproto-link.txt`.
+
+Что настраивает режим:
+
+- Telemt MTProto FakeTLS на **443/TCP**, SNI **www.booking.com**, без Nginx,
+  Certbot, WEB-listener и собственного сертификата.
+- Приём **PROXY protocol V1/V2**, с доверием только официальным IPv4-сетям Gcore,
+  чтобы Telemt видел адреса клиентов. Начальный `max_connections` — 16384.
+- Собственную цепочку iptables и ipset: TCP 443 допускается только от Gcore.
+  SSH, основной IP, маршруты и остальные порты не меняются; общий firewall не очищается.
+- Список сетей из `https://api.gcore.com/cdn/public-net-list`. API-ключ не нужен.
+  По документации Gcore Edge использует те же исходящие серверы, что и CDN.
+- Кеш сетей для загрузки VPS, отдельный firewall-сервис и обновление каждые
+  10 минут. Без изменения списка Telemt не перезапускается. При изменении списка
+  выполняется короткий перезапуск; при ошибке применения восстанавливаются
+  предыдущие конфигурация и firewall. При недоступности API сохраняется старый список.
+- SYN FIX для прямых клиентов **не устанавливается** (`-no-fix`): тысячи клиентов
+  приходят с нескольких адресов Gcore, и лимиты по исходному IP мешают соединениям.
+  Не включайте такие ограничения для Gcore позднее без исключений.
+
+После установки в кабинете Gcore создайте Edge Proxy:
+
+1. Origin — IPv4 **нового VPS**, который напечатает установщик.
+2. Профиль **Generic TCP Server**, порт **443**, протокол **TCP**.
+3. В Advanced включите **PROXY protocol V1** (V2 тоже поддерживается).
+4. Дождитесь активации и направьте A-запись клиентского поддомена на выданный
+   **Edge IP**. Это обычная A-запись, не CNAME HTTP CDN.
+5. Откройте полученную `tg://proxy` ссылку и проверьте отправку сообщений и фото
+   из РФ и другой сети. Открытый TCP-порт сам по себе не подтверждает передачу данных.
+
+Прямое подключение к IP VPS:443 в этом режиме ожидаемо запрещено. Если на стороне
+Gcore оставить PROXY protocol Off, Telegram работать не будет. Создание и оплата
+ресурса Gcore, изменение DNS и регистрация спонсорства выполняются отдельно —
+установщик этих действий не делает и не запрашивает API-ключи.
+
+```bash
+systemctl status telemt telemt-gcore-firewall.service telemt-gcore-refresh.timer
+journalctl -u telemt-gcore-refresh.service -u telemt-gcore-firewall.service --since today
+# Принудительно обновить официальный список:
+sudo systemctl start telemt-gcore-refresh.service
+```
+
+Помощник закреплён контрольной суммой в установщике. Его файлы:
+`/usr/local/lib/telemtproxy/gcore-edge.py`, `/etc/telemt/gcore-edge-cidrs.json`,
+резервная копия новой конфигурации до включения Edge —
+`/etc/telemt/telemt.toml.before-gcore` (только root).
+
+Настройки и откат проверяются автоматическими тестами с подменой системных команд.
+Реальный новый VPS и платный ресурс этим изменением не создавались; полный запуск
+проверяется после установки и активации конкретного Edge Proxy.
+
+Документация: [Gcore: настройка и список origin-адресов](https://github.com/G-Core/product-documentation/blob/main/edge-proxy/setup-and-configuration.mdx),
+[Telemt: PROXY protocol](https://github.com/telemt/telemt/blob/main/src/config/types/server.rs).
 
 ## WEB через CDN
 

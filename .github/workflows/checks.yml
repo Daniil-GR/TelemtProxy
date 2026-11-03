@@ -9,4 +9,5 @@ jobs:
         with:
           python-version: '3.12'
       - run: bash -n deploy.sh && bash -n deploy-mtproto.sh
+      - run: python -m py_compile gcore-edge.py
       - run: python -m unittest discover -s tests -v
