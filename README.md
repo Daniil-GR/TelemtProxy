@@ -48,7 +48,7 @@ HEX-строки здесь **примеры, а не действительны
 curl -fsSLo /tmp/telemtproxy-install.sh \
   https://raw.githubusercontent.com/Daniil-GR/TelemtProxy/main/deploy.sh
 sudo bash /tmp/telemtproxy-install.sh \
-  --resume --domain px.vetka.rest
+  --resume --domain proxy.example.org
 ~~~
 
 Подставьте действительный домен. Установщик **скрыто** попросит прежние 32 HEX символа `hello` и `ad_tag`. Это позволяет не передавать секреты в истории shell. Если оба параметра уже переданы через `--hello-secret` и `--ad-tag`, вопросов не будет.
