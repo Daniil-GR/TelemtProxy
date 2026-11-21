@@ -463,10 +463,16 @@ s = p.read_text(encoding='utf-8')
 pattern = re.compile(r'(?m)^([ \t]*)s\|S\)\s*_web_show_link\s+"\$cfg"\s*\|\|\s*true\s*;;[ \t]*$')
 found = list(pattern.finditer(s))
 if len(found) != 1:
+    # New MEKOPR uses pause_key after _web_show_link, so there is nothing to fix.
+    if re.search(r'(?m)^\s*s\|S\)\s*_web_show_link\s+"\$cfg"\s*\|\|\s*true\s*;\s*pause_key\b[^\n]*;;', s):
+        print('[OK] MEKOPR уже удерживает WEB-ссылку через pause_key. Исправление не требуется.')
+        sys.exit(0)
     if re.search(r'(?m)^[ \t]*s\|S\)[^\n]*_web_show_link[^\n]*(?:read -r|read -p)', s) or ('Нажмите Enter для возврата в меню' in s and re.search(r'(?m)^[ \t]*s\|S\)', s)):
         print('[OK] Пункт S уже исправлен.')
         sys.exit(0)
-    sys.exit(f'[ERROR] Ожидалась одна строка меню s|S, найдено {len(found)}. Исходник MEKOPR изменился, безопасная автозамена не выполнена.')
+    # Optional menu display fix must never prevent installing Telemt itself.
+    print(f'[WARN] Неизвестная версия меню MEKOPR: совпадений {len(found)}. Пропускаем необязательный патч и продолжаем установку.')
+    sys.exit(0)
 m = found[0]
 indent = m.group(1)
 new_case = '\n'.join((
