@@ -322,6 +322,38 @@ sudo bash /tmp/dns01-dynadot.sh issue --email admin@example.org
 sudo bash /tmp/dns01-dynadot.sh renew --email admin@example.org
 ~~~
 
+Пример ежедневного продления через systemd на машине выпуска (замените email на свой):
+
+~~~bash
+sudo install -m 700 /tmp/dns01-dynadot.sh /usr/local/sbin/telemtproxy-dns01-dynadot.sh
+
+sudo tee /etc/systemd/system/telemtproxy-wildcard-renew.service >/dev/null <<'EOF'
+[Unit]
+Description=Renew vetka.rest wildcard certificate using Dynadot DNS-01
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/telemtproxy-dns01-dynadot.sh renew --email admin@example.org
+EOF
+
+sudo tee /etc/systemd/system/telemtproxy-wildcard-renew.timer >/dev/null <<'EOF'
+[Unit]
+Description=Check wildcard certificate renewal daily
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=2h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now telemtproxy-wildcard-renew.timer
+sudo systemctl list-timers telemtproxy-wildcard-renew.timer
+~~~
+
 Helper использует `lego renew --days 30`, то есть новая выдача выполняется только при приближении срока. При смене сертификата он перезагружает локальный Nginx. **Helper не копирует сертификаты на другие VPS** — организуйте безопасное обновление файлов на всех используемых серверах и reload Nginx самостоятельно. Одна копия приватного ключа на многих VPS расширяет последствия компрометации.
 
 ### Установка WEB + MTProto с уже выпущенным wildcard
