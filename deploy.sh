@@ -27,6 +27,8 @@ Options:
   --hello-secret HEX     Reuse hello secret (32 HEX, without dd/ee)
   --hello HEX            Alias for --hello-secret
   --ad-tag HEX           Sponsor tag from @MTProxybot (32 HEX)
+  --wildcard-cert FILE   Existing DNS-01 wildcard fullchain (*.vetka.rest)
+  --wildcard-key FILE    Matching wildcard private key
   --cdn                  Use an existing trusted TLS origin certificate
   --origin-cert FILE     TLS origin fullchain for --cdn mode
   --origin-key FILE      TLS origin private key for --cdn mode
@@ -46,13 +48,15 @@ AD_TAG_FLAG_SET=0
 CDN_MODE=0
 ORIGIN_CERT=""
 ORIGIN_KEY=""
+WILDCARD_CERT=""
+WILDCARD_KEY=""
 while (( $# )); do
   case "$1" in
     --cdn)
       CDN_MODE=1
       shift
       ;;
-    --domain|--hello|--hello-secret|--ad-tag|--origin-cert|--origin-key)
+    --domain|--hello|--hello-secret|--ad-tag|--origin-cert|--origin-key|--wildcard-cert|--wildcard-key)
       option="$1"
       if (( $# < 2 )) || [[ -z "$2" || "$2" == --* ]]; then
         echo "Missing value for $option" >&2
@@ -80,6 +84,12 @@ while (( $# )); do
         --origin-key)
           ORIGIN_KEY="$value"
           ;;
+        --wildcard-cert)
+          WILDCARD_CERT="$value"
+          ;;
+        --wildcard-key)
+          WILDCARD_KEY="$value"
+          ;;
       esac
       shift 2
       ;;
@@ -101,6 +111,20 @@ done
 if (( CDN_MODE == 0 )) && [[ -n "$ORIGIN_CERT$ORIGIN_KEY" ]]; then
   echo 'Origin certificate flags require --cdn.' >&2
   exit 1
+fi
+if [[ -n "$WILDCARD_CERT$WILDCARD_KEY" ]]; then
+  if (( CDN_MODE == 1 )); then
+    echo 'Do not combine --cdn with --wildcard-cert / --wildcard-key.' >&2
+    exit 1
+  fi
+  if [[ -z "$WILDCARD_CERT" || -z "$WILDCARD_KEY" ]]; then
+    echo 'Both --wildcard-cert and --wildcard-key are required.' >&2
+    exit 1
+  fi
+  if [[ "$WILDCARD_CERT" != /* || "$WILDCARD_KEY" != /* ]]; then
+    echo 'Wildcard certificate and key paths must be absolute.' >&2
+    exit 1
+  fi
 fi
 if [[ -z "$DOMAIN" ]]; then
   if [[ ! -r /dev/tty ]]; then
@@ -128,6 +152,55 @@ if [[ -n "$AD_TAG" ]]; then
   fi
   AD_TAG="${AD_TAG,,}"
 fi
+# Reusing a wildcard DNS-01 certificate avoids a new exact-host CT entry.
+# Only a wildcard certificate with no explicit third-level DNS names qualifies.
+if [[ -n "$WILDCARD_CERT" ]]; then
+  [[ "$DOMAIN" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?\.vetka\.rest$ ]] || {
+    echo 'Wildcard mode covers only one-label subdomains of vetka.rest.' >&2
+    exit 1
+  }
+  [[ -s "$WILDCARD_CERT" && -s "$WILDCARD_KEY" ]] || {
+    echo 'Missing wildcard certificate or private key.' >&2
+    exit 1
+  }
+  command -v openssl >/dev/null 2>&1 || {
+    echo 'OpenSSL is needed to validate the wildcard certificate.' >&2
+    exit 1
+  }
+  python3 - "$WILDCARD_KEY" <<'PY'
+import os, stat, sys
+s = os.stat(sys.argv[1])
+if not stat.S_ISREG(s.st_mode) or s.st_uid != 0 or s.st_mode & 0o077:
+    sys.exit('Wildcard private key must be a root-owned regular file, mode 600 or stricter.')
+PY
+  openssl x509 -in "$WILDCARD_CERT" -noout -checkhost "$DOMAIN" >/dev/null 2>&1 || {
+    echo 'Wildcard certificate does not cover the requested WEB domain.' >&2; exit 1
+  }
+  openssl x509 -in "$WILDCARD_CERT" -noout -checkend 86400 >/dev/null 2>&1 || {
+    echo 'Wildcard certificate will expire within 24 hours.' >&2; exit 1
+  }
+  # Disallow exact hostname SANs, since they would still be logged in CT.
+  openssl x509 -in "$WILDCARD_CERT" -noout -ext subjectAltName |
+    python3 -c '
+import re, sys
+names = re.findall(r"DNS:([^,\s]+)", sys.stdin.read())
+if not names or "*.vetka.rest" not in names or any(n not in ("*.vetka.rest", "vetka.rest") for n in names):
+    sys.exit("Certificate SAN must contain *.vetka.rest with no individual subdomains.")
+' || exit 1
+  CERT_PUBLIC="$(openssl x509 -in "$WILDCARD_CERT" -pubkey -noout | openssl pkey -pubin -outform DER | openssl dgst -sha256)"
+  KEY_PUBLIC="$(openssl pkey -in "$WILDCARD_KEY" -passin pass: -pubout -outform DER 2>/dev/null | openssl dgst -sha256)"
+  [[ "$CERT_PUBLIC" == "$KEY_PUBLIC" ]] || { echo 'Wildcard certificate/key mismatch.' >&2; exit 1; }
+  WILDCARD_LEAF="$(mktemp)"
+  openssl x509 -in "$WILDCARD_CERT" -out "$WILDCARD_LEAF"
+  if ! openssl verify -untrusted "$WILDCARD_CERT" "$WILDCARD_LEAF" >/dev/null 2>&1; then
+    rm -f "$WILDCARD_LEAF"
+    echo 'Wildcard certificate chain is not publicly trusted.' >&2
+    exit 1
+  fi
+  rm -f "$WILDCARD_LEAF"
+  echo "[OK] Verified wildcard DNS-01 TLS certificate for $DOMAIN."
+fi
+
 if [[ ! -f /etc/os-release ]]; then echo 'This installer requires Ubuntu 24.04.' >&2; exit 1; fi
 . /etc/os-release
 if [[ "${ID:-}" != ubuntu || "${VERSION_ID:-}" != 24.04 ]]; then echo 'Supported OS: Ubuntu 24.04 only.' >&2; exit 1; fi
@@ -495,7 +568,7 @@ print('[OK] Asset size:',sum((public/n).stat().st_size for n in needed),'bytes')
 PY
 rm -f "$SITE_ZIP"
 
-echo '[5/8] Obtaining TLS certificate (port 80 must be reachable from Internet)...'
+echo '[5/8] Selecting TLS certificate...'
 if (( CDN_MODE == 1 )); then
   echo '[INFO] Using supplied origin certificate; CDN client certificate is managed in Gcore separately.'
   install -d -m 700 /etc/telemtproxy/origin
@@ -503,16 +576,21 @@ if (( CDN_MODE == 1 )); then
   install -m 600 "$ORIGIN_KEY" /etc/telemtproxy/origin/privkey.pem
   TLS_CERT_PATH=/etc/telemtproxy/origin/fullchain.pem
   TLS_KEY_PATH=/etc/telemtproxy/origin/privkey.pem
+elif [[ -n "$WILDCARD_CERT" ]]; then
+  echo '[INFO] Using existing DNS-01 wildcard certificate: no new certificate issued.'
+  TLS_CERT_PATH="$WILDCARD_CERT"
+  TLS_KEY_PATH="$WILDCARD_KEY"
 else
-systemctl stop nginx || true
-if ss -lntH | awk '$4 ~ /:80$/ {f=1} END {exit !f}'; then
+  echo '[INFO] Obtaining ordinary HTTP-01 certificate; port 80 must be reachable.'
+  systemctl stop nginx || true
+  if ss -lntH | awk '$4 ~ /:80$/ {f=1} END {exit !f}'; then
     echo 'Port 80 is still occupied; certbot standalone needs port 80.' >&2; exit 1
-fi
-certbot certonly --standalone --preferred-challenges http -d "$DOMAIN" \
-  --non-interactive --agree-tos --register-unsafely-without-email \
-  --keep-until-expiring
-TLS_CERT_PATH="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
-TLS_KEY_PATH="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+  fi
+  certbot certonly --standalone --preferred-challenges http -d "$DOMAIN" \
+    --non-interactive --agree-tos --register-unsafely-without-email \
+    --keep-until-expiring
+  TLS_CERT_PATH="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+  TLS_KEY_PATH="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
 fi
 
 if [[ ! -s "$TLS_CERT_PATH" || ! -s "$TLS_KEY_PATH" ]]; then
