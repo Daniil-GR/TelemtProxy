@@ -265,6 +265,22 @@ curl -I https://YOUR_DOMAIN/
 1. В Dynadot откройте **«Настройки DNS»** домена и убедитесь, что авторитативные NS используют **Dynadot DNS**. Если NS сторонние, API Dynadot не сможет менять рабочие DNS-записи. Не меняйте NS без необходимости.
 2. В аккаунте Dynadot откройте **Tools → API**, создайте API Key и API Secret, ограничьте разрешённые IP адресом **одного доверенного сервера выпуска**.
 3. На этой машине установите официальный `lego` версии **5.1+** (например, 5.6.0) из <https://github.com/go-acme/lego/releases>. Старые версии не содержат DNS-провайдер `dynadot`.
+На Ubuntu 24.04 x86_64 `lego 5.6.0` можно установить из официального релиза с проверкой SHA-256:
+
+~~~bash
+cd /tmp
+curl -fL --retry 3 -O \
+  https://github.com/go-acme/lego/releases/download/v5.6.0/lego_v5.6.0_linux_amd64.tar.gz
+curl -fL --retry 3 -O \
+  https://github.com/go-acme/lego/releases/download/v5.6.0/lego_5.6.0_checksums.txt
+grep 'lego_v5.6.0_linux_amd64.tar.gz' lego_5.6.0_checksums.txt | sha256sum -c -
+tar -xzf lego_v5.6.0_linux_amd64.tar.gz lego
+sudo install -m 755 lego /usr/local/bin/lego
+lego --version
+~~~
+
+Для ARM64 выберите соответствующий архив из официального релиза и аналогично проверьте checksum.
+
 4. На машине выпуска создайте защищённый файл с ключами:
 
 ~~~bash
