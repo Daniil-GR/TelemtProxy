@@ -254,3 +254,79 @@ curl -I https://YOUR_DOMAIN/
 - Разные VPS получают уникальные статические ресурсы (HTML/CSS/JS/SVG).
 - Установщик предназначен **только для нового сервера** и не перезаписывает существующие установки Telemt/MEKOPR.
 - Если сертификат не выпущен из-за DNS `NXDOMAIN`, исправьте DNS и завершайте частичную установку без повторного запуска полного развертывания.
+
+
+## Wildcard DNS-01 для vetka.rest (Dynadot)
+
+Цель — **уменьшить раскрытие имён отдельных WEB-поддоменов через Certificate Transparency (CT)**. Wildcard-сертификат НЕ скрывает IP, доступный через DNS. Ранее опубликованные CT-записи не исчезают. Сертификат `*.vetka.rest` подходит для `lt.vetka.rest` и `chicago.vetka.rest`, но не для `vetka.rest` или `a.b.vetka.rest`.
+
+### Подготовка DNS-01
+
+1. В Dynadot откройте **«Настройки DNS»** домена и убедитесь, что авторитативные NS используют **Dynadot DNS**. Если NS сторонние, API Dynadot не сможет менять рабочие DNS-записи. Не меняйте NS без необходимости.
+2. В аккаунте Dynadot откройте **Tools → API**, создайте API Key и API Secret, ограничьте разрешённые IP адресом **одного доверенного сервера выпуска**.
+3. На этой машине установите официальный `lego` версии **5.1+** (например, 5.6.0) из <https://github.com/go-acme/lego/releases>. Старые версии не содержат DNS-провайдер `dynadot`.
+4. На машине выпуска создайте защищённый файл с ключами:
+
+~~~bash
+sudo install -d -m 700 /etc/telemtproxy
+sudo install -m 600 /dev/null /etc/telemtproxy/dynadot.env
+sudo nano /etc/telemtproxy/dynadot.env
+~~~
+
+Содержимое (заменить значения на свои, **не отправлять их в чат или GitHub**):
+
+~~~bash
+DYNADOT_API_KEY='ВАШ_API_KEY'
+DYNADOT_API_SECRET='ВАШ_API_SECRET'
+~~~
+
+Для DNS-01 заранее не нужно добавлять TXT: `lego` создаст и удалит временную `_acme-challenge.vetka.rest` через API Dynadot.
+
+### Выпуск и продление wildcard
+
+На доверенной машине:
+
+~~~bash
+curl -fsSLo /tmp/dns01-dynadot.sh \
+  https://raw.githubusercontent.com/Daniil-GR/TelemtProxy/main/dns01-dynadot.sh
+
+sudo bash /tmp/dns01-dynadot.sh issue --email admin@example.org
+~~~
+
+Адрес `admin@example.org` — пример, замените на свой. По завершении файлы находятся здесь:
+
+~~~text
+/var/lib/telemtproxy/lego-vetka/certificates/_.vetka.rest.crt
+/var/lib/telemtproxy/lego-vetka/certificates/_.vetka.rest.key
+~~~
+
+Продление (исполняйте ежедневно через защищённый системный cron/systemd timer):
+
+~~~bash
+sudo bash /tmp/dns01-dynadot.sh renew --email admin@example.org
+~~~
+
+Helper использует `lego renew --days 30`, то есть новая выдача выполняется только при приближении срока. При смене сертификата он перезагружает локальный Nginx. **Helper не копирует сертификаты на другие VPS** — организуйте безопасное обновление файлов на всех используемых серверах и reload Nginx самостоятельно. Одна копия приватного ключа на многих VPS расширяет последствия компрометации.
+
+### Установка WEB + MTProto с уже выпущенным wildcard
+
+Скопируйте сертификат и приватный ключ на чистый VPS в защищённый каталог, например:
+
+~~~text
+/etc/telemtproxy/wildcard/fullchain.pem
+/etc/telemtproxy/wildcard/privkey.pem
+~~~
+
+Приватный ключ должен быть `root:root`, с правами `600`. Затем:
+
+~~~bash
+sudo bash /tmp/telemtproxy-install.sh \
+  --domain lt.vetka.rest \
+  --wildcard-cert /etc/telemtproxy/wildcard/fullchain.pem \
+  --wildcard-key /etc/telemtproxy/wildcard/privkey.pem
+~~~
+
+При необходимости добавьте `--hello-secret` и `--ad-tag`. Установщик проверяет сертификат и приватный ключ, запрещает сертификаты с индивидуальными именами поддоменов в SAN и **не запрашивает HTTP-01 сертификат на каждый WEB-поддомен**. Это не меняет работу MTProto на TCP 9443.
+
+**Продление:** установщик не продлевает переданные wildcard-файлы. Когда копируете обновлённую пару в те же пути, проверьте `nginx -t` и выполните `systemctl reload nginx`. Режимы `--wildcard-cert` и `--cdn` взаимоисключающие.
+
