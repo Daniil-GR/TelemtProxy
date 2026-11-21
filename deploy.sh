@@ -261,9 +261,21 @@ if (( RESUME_MODE == 1 )); then
   dpkg --verify nginx-common >/dev/null 2>&1 || {
     echo 'Cannot resume: Nginx is not in its unmodified stock Ubuntu state.' >&2; exit 1
   }
-  systemctl is-active --quiet telemt || {
-    echo 'Cannot resume: Telemt service is not active.' >&2; exit 1
-  }
+  # MEKOPR may have left Telemt inactive/failed with its intermediate WEB
+  # configuration. The final configuration is written in stage 3, then stage 7
+  # restarts Telemt and checks its WEB listener. Require a real unit, not uptime.
+  TELEMT_UNIT_STATE="$(systemctl show telemt.service --property=LoadState --value 2>/dev/null || true)"
+  if [[ "$TELEMT_UNIT_STATE" != loaded ]]; then
+    echo 'Cannot resume: Telemt systemd unit is not loaded.' >&2
+    exit 1
+  fi
+  if [[ "$(systemctl is-enabled telemt.service 2>/dev/null || true)" == masked ]]; then
+    echo 'Cannot resume: Telemt service is masked.' >&2
+    exit 1
+  fi
+  if ! systemctl is-active --quiet telemt; then
+    echo '[RESUME] Telemt is currently inactive. Will rebuild its configuration and restart at stage 7.'
+  fi
   python3 - "$DOMAIN" <<'PY'
 import sys, tomllib
 with open('/etc/telemt/telemt.toml', 'rb') as f:
