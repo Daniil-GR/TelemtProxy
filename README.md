@@ -256,125 +256,129 @@ curl -I https://YOUR_DOMAIN/
 - Если сертификат не выпущен из-за DNS `NXDOMAIN`, исправьте DNS и завершайте частичную установку без повторного запуска полного развертывания.
 
 
-## Wildcard DNS-01 для vetka.rest (Dynadot)
+## Автоматический wildcard DNS-01: менеджер → VPS
 
-Цель — **уменьшить раскрытие имён отдельных WEB-поддоменов через Certificate Transparency (CT)**. Wildcard-сертификат НЕ скрывает IP, доступный через DNS. Ранее опубликованные CT-записи не исчезают. Сертификат `*.vetka.rest` подходит для `lt.vetka.rest` и `chicago.vetka.rest`, но не для `vetka.rest` или `a.b.vetka.rest`.
+Цель — уменьшить раскрытие индивидуальных WEB-имён в CT. ACME получает **только `*.vetka.rest`**, без `vetka.rest`, `lt.vetka.rest` и других SAN. Уже существующие записи CT не исчезают; DNS и IP остаются публичными. Поддерживаются только одноуровневые поддомены.
 
-### Подготовка DNS-01
+### Архитектура и границы доверия
 
-1. В Dynadot откройте **«Настройки DNS»** домена и убедитесь, что авторитативные NS используют **Dynadot DNS**. Если NS сторонние, API Dynadot не сможет менять рабочие DNS-записи. Не меняйте NS без необходимости.
-2. В аккаунте Dynadot откройте **Tools → API**, создайте API Key и API Secret, ограничьте разрешённые IP адресом **одного доверенного сервера выпуска**.
-3. На этой машине установите официальный `lego` версии **5.1+** (например, 5.6.0) из <https://github.com/go-acme/lego/releases>. Старые версии не содержат DNS-провайдер `dynadot`.
-На Ubuntu 24.04 x86_64 `lego 5.6.0` можно установить из официального релиза с проверкой SHA-256:
+Один доверенный менеджер выпускает wildcard через lego/Dynadot. Он хранит DNS-ключи и отдаёт TLS-пару по HTTPS `/v1/certificate` только с отдельным кодом каждого VPS. Это не публичная ссылка: без `Authorization: Bearer …` выдача запрещена; редиректы запрещены, доверие TLS проверяется системным CA. На VPS нет ключей Dynadot и нет DNS-операций. Сервер выдачи не принимает имена для ACME и не запускает выпуск по сетевому запросу.
 
-~~~bash
-cd /tmp
-curl -fL --retry 3 -O \
-  https://github.com/go-acme/lego/releases/download/v5.6.0/lego_v5.6.0_linux_amd64.tar.gz
-curl -fL --retry 3 -O \
-  https://github.com/go-acme/lego/releases/download/v5.6.0/lego_5.6.0_checksums.txt
-grep 'lego_v5.6.0_linux_amd64.tar.gz' lego_5.6.0_checksums.txt | sha256sum -c -
-tar -xzf lego_v5.6.0_linux_amd64.tar.gz lego
-sudo install -m 755 lego /usr/local/bin/lego
-lego --version
-~~~
+Используется **одна общая wildcard-пара**, а не отдельный ключ для каждого VPS: это простая схема без отдельного ACME-заказа на каждый новый сервер и без быстрого расходования лимита одинаковых наборов SAN. Цена — компрометация любого VPS раскрывает wildcard-ключ и позволяет представляться любым одноуровневым поддоменом. Отдельные коды доставки изолируют доступ к сервису и позволяют отзывать клиентов, но не изолируют уже выданный общий TLS-ключ. Если такая граница доверия неприемлема, эту архитектуру использовать нельзя; нужны индивидуальные ключи/CSR и отдельная политика лимитов ACME. Они в этой версии не реализованы.
 
-Для ARM64 выберите соответствующий архив из официального релиза и аналогично проверьте checksum.
+### Фактические права Dynadot
 
-4. На машине выпуска создайте защищённый файл с ключами:
+Официальные [настройки API](https://www.dynadot.com/help/question/find-API-settings) подтверждают API Key + Secret и IP/CIDR whitelist. [REST API](https://www.dynadot.com/domain/api-document) использует HMAC-подпись для изменяющих/чувствительных запросов.
 
-~~~bash
-sudo install -d -m 700 /etc/telemtproxy
-sudo install -m 600 /dev/null /etc/telemtproxy/dynadot.env
-sudo nano /etc/telemtproxy/dynadot.env
-~~~
+**Ограничение Restricted Key до одного домена или только TXT официальными материалами не подтверждено и в аккаунте не проверено.** В этой работе новый ключ не создан. Не считайте `Domains: Write` разрешением только на `_acme-challenge` или только на `vetka.rest`: пока scope не подтверждён настройками аккаунта, рассматривайте его как потенциальный доступ к управлению доменами аккаунта. Точный состав разрешений Write (включая регистрацию, перенос, контакты) требует проверки в интерфейсе/у поддержки; название не доказывает запрет этих операций.
 
-Содержимое (заменить значения на свои, **не отправлять их в чат или GitHub**):
+На этапе первоначальной настройки создайте **отдельную** пару с меткой `TelemtProxy DNS-01 — vetka.rest`, если интерфейс аккаунта поддерживает Restricted Keys: оставьте минимальные DNS-права, отключите прочие категории, добавьте IP менеджера `/32`. Если доступны только Domains: Write, явно примите более широкий scope либо отложите запуск. Основной ключ не заменяйте. Не выполняйте проверку прав разрушительными API-вызовами. Скрипт не создаёт API-ключи, не меняет whitelist и не придумывает endpoint для их создания.
 
-~~~bash
-DYNADOT_API_KEY='ВАШ_API_KEY'
-DYNADOT_API_SECRET='ВАШ_API_SECRET'
-~~~
+Изоляция от VPS обеспечивается менеджером: клиент имеет только чтение фиксированной TLS-пары. Сам менеджер остаётся доверенной точкой с возможным более широким доступом к Dynadot. Делегирование NS/CNAME challenge не выполняется.
 
-Для DNS-01 заранее не нужно добавлять TXT: `lego` создаст и удалит временную `_acme-challenge.vetka.rest` через API Dynadot.
+### Однократная подготовка менеджера
 
-### Выпуск и продление wildcard
+Следующие команды — инструкция для будущего запуска администратором. В рамках разработки никакие VPS, DNS и аккаунт Dynadot не изменялись.
 
-На доверенной машине:
+Нужен отдельный доверенный Ubuntu 24.04 с фиксированным исходящим IP и заранее подготовленным именем менеджера, например `certs.vetka.rest`. Оно должно вести на менеджер; имя покрывается wildcard. Нужно обеспечить доступ клиентов к TCP 9444 (желательно через доверенную сеть или firewall allowlist). Установщик не меняет firewall и DNS. Не запускайте `setup` на существующем занятом сервере без проверки портов и файлов. Репозиторий приватный: используйте свой уже настроенный доступ GitHub, не помещайте GitHub-токены в команду или журнал.
 
-~~~bash
-curl -fsSLo /tmp/dns01-dynadot.sh \
-  https://raw.githubusercontent.com/Daniil-GR/TelemtProxy/main/dns01-dynadot.sh
+```bash
+git clone https://github.com/Daniil-GR/TelemtProxy.git
+cd TelemtProxy
+sudo bash dns01-dynadot.sh setup --email YOUR_ACME_EMAIL
+```
 
-sudo bash /tmp/dns01-dynadot.sh issue --email admin@example.org
-~~~
+`YOUR_ACME_EMAIL` замените своим адресом. Setup устанавливает зависимости и lego >=5.6.0 (новая установка — закреплённая 5.6.0 с проверкой SHA256 официального архива), запрашивает ключ и secret скрытым вводом, сохраняет их только в `/etc/telemtproxy/dynadot.env` (`root:root`, 600). Уже существующий файл не заменяется. Не запускайте установщики с `bash -x`.
 
-Адрес `admin@example.org` — пример, замените на свой. По завершении файлы находятся здесь:
+Скрипт проверяет авторитативность Dynadot NS, отказывается работать при NS/CNAME-делегировании challenge, сравнивает TXT до/после, сериализует операции. lego добавляет TXT к текущим записям и удаляет только совпадающий TXT. Если очистка не подтверждена, новый TLS не публикуется; неизвестные записи автоматически не удаляются. Диагностика локальная, root-only, с редактированием значений API-секретов. При ошибке DNS-01 перехода на HTTP-01 нет.
 
-~~~text
-/var/lib/telemtproxy/lego-vetka/certificates/_.vetka.rest.crt
-/var/lib/telemtproxy/lego-vetka/certificates/_.vetka.rest.key
-~~~
+Сначала проверьте staging на менеджере (setup установит зависимости и запросит ключи, но не включит сервис выдачи):
 
-Продление (исполняйте ежедневно через защищённый системный cron/systemd timer):
+```bash
+sudo bash dns01-dynadot.sh setup --staging --email YOUR_ACME_EMAIL
+```
 
-~~~bash
-sudo bash /tmp/dns01-dynadot.sh renew --email admin@example.org
-~~~
+Staging использует отдельное хранилище и никогда не попадает в раздаваемую production-пару. Не запускайте повторный `issue` для существующего заказа: используйте `renew --staging`.
 
-Пример ежедневного продления через systemd на машине выпуска (замените email на свой):
+После setup менеджер доступен как `https://certs.vetka.rest:9444`. Первичный выпуск не требует сертификата на конкретное имя менеджера: TLS-сервер запускается после DNS-01 wildcard. Выдача сертификатов требует действующего доверенного сертификата менеджера, поэтому следите за таймером выпуска и сроком действия.
 
-~~~bash
-sudo install -m 700 /tmp/dns01-dynadot.sh /usr/local/sbin/telemtproxy-dns01-dynadot.sh
+### Код доступа для нового VPS
 
-sudo tee /etc/systemd/system/telemtproxy-wildcard-renew.service >/dev/null <<'EOF'
-[Unit]
-Description=Renew vetka.rest wildcard certificate using Dynadot DNS-01
+На менеджере один раз зарегистрируйте VPS (можно заранее подготовить несколько кодов):
 
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/telemtproxy-dns01-dynadot.sh renew --email admin@example.org
-EOF
+```bash
+sudo python3 /usr/local/lib/telemtproxy/wildcard.py manager-add-node lt
+```
 
-sudo tee /etc/systemd/system/telemtproxy-wildcard-renew.timer >/dev/null <<'EOF'
-[Unit]
-Description=Check wildcard certificate renewal daily
+Команда показывает случайный код **единственный раз**. В реестре хранится его SHA256; код предназначен для одного VPS, но является постоянным для последующих обновлений, а не одноразовым. Сохраните его в защищённом менеджере паролей. Не передавайте через CLI, URL, Git или обычные логи. Это необходимая авторизация регистрации: полностью анонимная установка не поддерживается.
 
-[Timer]
-OnCalendar=daily
-RandomizedDelaySec=2h
-Persistent=true
+### Одна команда на чистом VPS
 
-[Install]
-WantedBy=timers.target
-EOF
+```bash
+python3 - <<'INSTALL'
+import base64, getpass, json, os, subprocess, tempfile, urllib.request
+request = urllib.request.Request(
+    'https://api.github.com/repos/Daniil-GR/TelemtProxy/contents/deploy.sh?ref=main',
+    headers={'Authorization': 'Bearer ' + getpass.getpass('GitHub read token (hidden): '),
+             'Accept': 'application/vnd.github+json'})
+with urllib.request.urlopen(request, timeout=30) as response:
+    script = base64.b64decode(json.load(response)['content'])
+fd, name = tempfile.mkstemp(prefix='telemtproxy-', suffix='.sh')
+try:
+    with os.fdopen(fd, 'wb') as f:
+        f.write(script)
+    subprocess.run(['sudo', 'bash', name, '--domain', 'lt.vetka.rest', '--wildcard'], check=True)
+finally:
+    os.unlink(name)
+INSTALL
+```
 
-sudo systemctl daemon-reload
-sudo systemctl enable --now telemtproxy-wildcard-renew.timer
-sudo systemctl list-timers telemtproxy-wildcard-renew.timer
-~~~
+Репозиторий приватный: команда сначала спросит GitHub-токен с правом чтения Contents только этого репозитория; значение не передаётся в CLI и не сохраняется в файл. Без авторизации обычный raw.githubusercontent.com URL возвращает 404. Python входит в стандартный образ Ubuntu 24.04.
 
-Helper использует `lego renew --days 30`, то есть новая выдача выполняется только при приближении срока. При смене сертификата он перезагружает локальный Nginx. **Helper не копирует сертификаты на другие VPS** — организуйте безопасное обновление файлов на всех используемых серверах и reload Nginx самостоятельно. Одна копия приватного ключа на многих VPS расширяет последствия компрометации.
+Затем установщик спросит HTTPS-адрес менеджера и затем код доставки скрытым вводом. Адрес можно указать заранее через `--cert-manager https://certs.vetka.rest:9444` (это не секрет). Далее автоматически ставятся WEB + MTProto, Telemt, MEKOPR, Nginx, заглушка, TLS и таймер обновления. Сертификат не нужно копировать и выпускать на VPS вручную. Домен должен заранее указывать на VPS, как и в обычном WEB-режиме.
 
-### Установка WEB + MTProto с уже выпущенным wildcard
+`--hello-secret` / `--ad-tag` сохранены. Секреты этих старых флагов по-прежнему могут попасть в shell history — это не способ передачи DNS-ключей. `--wildcard` нельзя сочетать с CDN/origin-флагами и `--wildcard-cert/--wildcard-key`. Обычные WEB, MTProto-only, CDN и Edge Proxy остаются отдельными прежними режимами. При недоступном менеджере установка завершается с ошибкой, **не выпуская сертификат на конкретный WEB-поддомен**. Повторный запуск на действующей установке блокируется; для обновления сертификата используйте таймер, не переустановку Telemt.
 
-Скопируйте сертификат и приватный ключ на чистый VPS в защищённый каталог, например:
+Старые `--wildcard-cert FILE --wildcard-key FILE` сохранены для ручного управления; сертификат теперь должен иметь ровно один SAN `*.vetka.rest`. Для переданных вручную файлов автоматическое продление не включается.
 
-~~~text
-/etc/telemtproxy/wildcard/fullchain.pem
-/etc/telemtproxy/wildcard/privkey.pem
-~~~
+### Продление, откат, диагностика
 
-Приватный ключ должен быть `root:root`, с правами `600`. Затем:
+- Менеджер: `telemtproxy-wildcard-issuer.timer` каждые 6 часов; `lego run --renew-days 30` продлевает при остатке менее 30 дней. CLI v5 объединяет выдачу и продление в `run`; старая команда `lego renew` не используется.
+- Клиент: `telemtproxy-wildcard-client.timer` каждые 6 часов плюс случайный сдвиг до 15 минут; при старте системы первая проверка через 5 минут.
+- Небольшая задержка доставки нормальна: менеджер сначала продлевает, затем клиенты подтягивают новую пару. Сроки подобраны с запасом.
+- Загрузка повторяется трижды при временных сетевых ошибках/5xx. Ошибки авторизации не повторяются. Ошибки выпуска повторяются следующим запуском таймера; ручной запуск доступен.
+- Файлы проходят проверку доверенной цепочки, срока, соответствия ключа и **строго одного SAN**. Сертификат и ключ переключаются одной символьной ссылкой `current`; при ошибке `nginx -t` или reload ссылка возвращается на предыдущую пару. Старый рабочий TLS сохраняется. Одна предыдущая генерация оставляется для восстановления.
+- Nginx получает graceful reload только при изменении пары. Telemt не перезапускается. Все приватные TLS-файлы имеют 600, каталоги хранилища — 700.
 
-~~~bash
-sudo bash /tmp/telemtproxy-install.sh \
-  --domain lt.vetka.rest \
-  --wildcard-cert /etc/telemtproxy/wildcard/fullchain.pem \
-  --wildcard-key /etc/telemtproxy/wildcard/privkey.pem
-~~~
+```bash
+# На обеих ролях: срок и отпечаток, без приватного ключа
+sudo python3 /usr/local/lib/telemtproxy/wildcard.py status
 
-При необходимости добавьте `--hello-secret` и `--ad-tag`. Установщик проверяет сертификат и приватный ключ, запрещает сертификаты с индивидуальными именами поддоменов в SAN и **не запрашивает HTTP-01 сертификат на каждый WEB-поддомен**. Это не меняет работу MTProto на TCP 9443.
+# На менеджере
+systemctl list-timers telemtproxy-wildcard-issuer.timer
+journalctl -u telemtproxy-wildcard-issuer.service --since today
+sudo systemctl start telemtproxy-wildcard-issuer.service
 
-**Продление:** установщик не продлевает переданные wildcard-файлы. Когда копируете обновлённую пару в те же пути, проверьте `nginx -t` и выполните `systemctl reload nginx`. Режимы `--wildcard-cert` и `--cdn` взаимоисключающие.
+# На VPS
+systemctl list-timers telemtproxy-wildcard-client.timer
+journalctl -u telemtproxy-wildcard-client.service --since today
+sudo systemctl start telemtproxy-wildcard-client.service
+```
 
+Не публикуйте файлы из `/etc/telemtproxy` и `/var/lib/telemtproxy`. Ошибка API/whitelist: проверьте права отдельного ключа и исходящий IP менеджера, затем подождите применения whitelist. Несовпадение TXT со снимком: сравните записи вручную; не очищайте всю `_acme-challenge` и не восстанавливайте целую зону поверх других изменений.
+
+Отзыв доступа VPS:
+
+```bash
+sudo python3 /usr/local/lib/telemtproxy/wildcard.py manager-revoke-node lt
+```
+
+Это прекращает будущую доставку, но не отзывает уже скопированный wildcard-ключ. При утечке TLS-ключа изолируйте VPS, отзовите сертификат в ACME, создайте новую пару (не используйте старый скомпрометированный ключ), обновите всех доверенных клиентов и проверьте отпечатки. Автоматическая команда аварийной ротации/ACME-revoke в этой версии не реализована. При утечке Dynadot-пары отзовите только отдельный ключ в аккаунте, создайте новый с минимальными правами и замените локальный файл 600; основной ключ не трогайте.
+
+### Что проверено, а что ещё требуется
+
+Автотесты проверяют сертификаты локального тестового CA, отказ от дополнительных SAN и чужого ключа, права файлов, откат после сбоя, идемпотентность, авторизацию, отказ редиректов и HTTP, повторы сети, mock DNS-01 и сохранение чужих TXT, ошибки флагов и прежние режимы. Это **не реальный выпуск Let's Encrypt и не развёртывание на Ubuntu VPS**.
+
+Перед production необходимо: проверить реальные права Restricted Key в кабинете, подготовить менеджер и его DNS/сетевой доступ, пройти ACME staging, затем production setup и проверить доставку/продление на отдельном чистом VPS. Ничего из этого не выдаётся за выполненное без запуска на серверах.
+
+Источники: [lego Dynadot](https://go-acme.github.io/lego/dns/index.print.html#dynadot), [провайдер v5.6.0: добавление и точечная очистка TXT](https://github.com/go-acme/lego/blob/v5.6.0/providers/dns/dynadot/dynadot.go), [релизы lego](https://github.com/go-acme/lego/releases), [лимиты Let's Encrypt](https://letsencrypt.org/docs/rate-limits/).

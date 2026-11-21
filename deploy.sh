@@ -27,6 +27,8 @@ Options:
   --hello-secret HEX     Reuse hello secret (32 HEX, without dd/ee)
   --hello HEX            Alias for --hello-secret
   --ad-tag HEX           Sponsor tag from @MTProxybot (32 HEX)
+  --wildcard             Fetch wildcard TLS from the private certificate manager
+  --cert-manager URL     HTTPS manager origin (otherwise prompted)
   --wildcard-cert FILE   Existing DNS-01 wildcard fullchain (*.vetka.rest)
   --wildcard-key FILE    Matching wildcard private key
   --cdn                  Use an existing trusted TLS origin certificate
@@ -50,13 +52,18 @@ ORIGIN_CERT=""
 ORIGIN_KEY=""
 WILDCARD_CERT=""
 WILDCARD_KEY=""
+AUTO_WILDCARD=0
+CERT_MANAGER=""
 while (( $# )); do
   case "$1" in
+    --wildcard)
+      AUTO_WILDCARD=1; shift
+      ;;
     --cdn)
       CDN_MODE=1
       shift
       ;;
-    --domain|--hello|--hello-secret|--ad-tag|--origin-cert|--origin-key|--wildcard-cert|--wildcard-key)
+    --domain|--hello|--hello-secret|--ad-tag|--origin-cert|--origin-key|--wildcard-cert|--wildcard-key|--cert-manager)
       option="$1"
       if (( $# < 2 )) || [[ -z "$2" || "$2" == --* ]]; then
         echo "Missing value for $option" >&2
@@ -84,6 +91,9 @@ while (( $# )); do
         --origin-key)
           ORIGIN_KEY="$value"
           ;;
+        --cert-manager)
+          CERT_MANAGER="$value"
+          ;;
         --wildcard-cert)
           WILDCARD_CERT="$value"
           ;;
@@ -108,6 +118,13 @@ while (( $# )); do
       ;;
   esac
 done
+if (( AUTO_WILDCARD == 1 )); then
+  if (( CDN_MODE == 1 )) || [[ -n "$WILDCARD_CERT$WILDCARD_KEY$ORIGIN_CERT$ORIGIN_KEY" ]]; then
+    echo '--wildcard cannot be combined with CDN or supplied certificate flags.' >&2; exit 1
+  fi
+elif [[ -n "$CERT_MANAGER" ]]; then
+  echo '--cert-manager requires --wildcard.' >&2; exit 1
+fi
 if (( CDN_MODE == 0 )) && [[ -n "$ORIGIN_CERT$ORIGIN_KEY" ]]; then
   echo 'Origin certificate flags require --cdn.' >&2
   exit 1
@@ -152,6 +169,22 @@ if [[ -n "$AD_TAG" ]]; then
   fi
   AD_TAG="${AD_TAG,,}"
 fi
+if (( AUTO_WILDCARD == 1 )); then
+  [[ "$DOMAIN" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.vetka\.rest$ ]] || {
+    echo 'Wildcard mode covers only one-label subdomains of vetka.rest.' >&2; exit 1;
+  }
+  if [[ -z "$CERT_MANAGER" ]]; then
+    read -r -p 'Certificate manager HTTPS origin: ' CERT_MANAGER </dev/tty
+  fi
+  python3 - "$CERT_MANAGER" <<'WILDCARD_URL'
+import sys
+from urllib.parse import urlsplit
+p=urlsplit(sys.argv[1])
+if p.scheme!='https' or not p.hostname or p.username or p.password or p.query or p.fragment or p.path not in ('','/'):
+    sys.exit('Invalid certificate manager HTTPS origin')
+WILDCARD_URL
+  [[ ! -e /etc/telemtproxy/wildcard-client.json ]] || { echo 'Wildcard client already configured; inspect it before rerunning installation.' >&2; exit 1; }
+fi
 # Reusing a wildcard DNS-01 certificate avoids a new exact-host CT entry.
 # Only a wildcard certificate with no explicit third-level DNS names qualifies.
 if [[ -n "$WILDCARD_CERT" ]]; then
@@ -169,7 +202,7 @@ if [[ -n "$WILDCARD_CERT" ]]; then
   }
   python3 - "$WILDCARD_KEY" <<'PY'
 import os, stat, sys
-s = os.stat(sys.argv[1])
+s = os.lstat(sys.argv[1])
 if not stat.S_ISREG(s.st_mode) or s.st_uid != 0 or s.st_mode & 0o077:
     sys.exit('Wildcard private key must be a root-owned regular file, mode 600 or stricter.')
 PY
@@ -183,8 +216,8 @@ PY
   openssl x509 -in "$WILDCARD_CERT" -noout -ext subjectAltName |
     python3 -c '
 import re, sys
-names = re.findall(r"DNS:([^,\s]+)", sys.stdin.read())
-if not names or "*.vetka.rest" not in names or any(n not in ("*.vetka.rest", "vetka.rest") for n in names):
+san = "".join(sys.stdin.read().splitlines()[1:]).strip()
+if san != "DNS:*.vetka.rest":
     sys.exit("Certificate SAN must contain *.vetka.rest with no individual subdomains.")
 ' || exit 1
   CERT_PUBLIC="$(openssl x509 -in "$WILDCARD_CERT" -pubkey -noout | openssl pkey -pubin -outform DER | openssl dgst -sha256)"
@@ -217,7 +250,7 @@ if (( CDN_MODE == 1 )); then
   command -v openssl >/dev/null || { echo 'OpenSSL is required for origin certificate preflight.' >&2; exit 1; }
   python3 - "$ORIGIN_KEY" <<'PY'
 import os, stat, sys
-s = os.stat(sys.argv[1])
+s = os.lstat(sys.argv[1])
 if not stat.S_ISREG(s.st_mode) or s.st_uid != 0 or s.st_mode & 0o077:
     sys.exit('Origin private key must be a root-owned regular file with mode 600 or stricter.')
 PY
@@ -370,6 +403,20 @@ apt-get install -y -qq ca-certificates curl openssl python3 nginx certbot iprout
 if systemctl is-active --quiet nginx; then
   echo '[INFO] Stopping Nginx auto-started by the Ubuntu package.'
   systemctl stop nginx
+fi
+
+if (( AUTO_WILDCARD == 1 )); then
+  install -d -m 755 /usr/local/lib/telemtproxy
+  python3 - <<'WILDCARD_HELPER'
+import base64,zlib
+from pathlib import Path
+p=Path('/usr/local/lib/telemtproxy/wildcard.py')
+p.write_bytes(zlib.decompress(base64.b64decode('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')))
+p.chmod(0o644)
+WILDCARD_HELPER
+  python3 /usr/local/lib/telemtproxy/wildcard.py client-setup --manager "$CERT_MANAGER" --domain "$DOMAIN"
+  WILDCARD_CERT=/var/lib/telemtproxy/wildcard-client/current/fullchain.pem
+  WILDCARD_KEY=/var/lib/telemtproxy/wildcard-client/current/privkey.pem
 fi
 
 # Open only required TCP ports if UFW is already active; never enable or reset it.
@@ -692,6 +739,9 @@ if [[ "$ROOT" != *'game.js?v='* || "$ROOT" != *'<title>'* ]]; then
 fi
 curl -4 -fsS --noproxy '*' --connect-timeout 5 --max-time 15 --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/game.js" -o /dev/null
 curl -4 -fsS --noproxy '*' --connect-timeout 5 --max-time 15 --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/style.css" -o /dev/null
+if (( AUTO_WILDCARD == 1 )); then
+  python3 /usr/local/lib/telemtproxy/wildcard.py client-enable
+fi
 cat <<EOF
 
 ====================== READY ======================
@@ -847,3 +897,4 @@ FAAAAAgAITRXXUm5X+3iDQAALCgAAAcAAAAAAAAAAAAAAKSB9QAAAGdhbWUuanNQSwECFAMUAAAA
 CAAhNFddopxdtWwGAAD0DwAACgAAAAAAAAAAAAAApIH8DgAAaW5kZXguaHRtbFBLAQIUAxQAAAAI
 ACE0V12Rx++viwgAAL8aAAAJAAAAAAAAAAAAAACkgZAVAABzdHlsZS5jc3NQSwUGAAAAAAQABADd
 AAAAQh4AAAAA
+
