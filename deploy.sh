@@ -18,32 +18,93 @@ installer_cleanup_on_exit() {
 trap installer_cleanup_on_exit EXIT
 
 if [[ "${EUID}" -ne 0 ]]; then echo 'Run as root: sudo bash deploy.sh' >&2; exit 1; fi
+usage() {
+  cat <<'USAGE'
+Usage: sudo bash deploy.sh [DOMAIN] [OPTIONS]
+
+Options:
+  --domain FQDN          Domain for WEB proxy (or positional DOMAIN)
+  --hello-secret HEX     Reuse hello secret (32 HEX, without dd/ee)
+  --hello HEX            Alias for --hello-secret
+  --ad-tag HEX           Sponsor tag from @MTProxybot (32 HEX)
+  --cdn                  Use an existing trusted TLS origin certificate
+  --origin-cert FILE     TLS origin fullchain for --cdn mode
+  --origin-key FILE      TLS origin private key for --cdn mode
+  --help, -h             Show help
+
+If --hello-secret is absent, a new secret is generated. An absent --ad-tag
+leaves the sponsored-channel tag unset. CLI secrets can appear in shell
+history and process listings. For direct mode, the MTProto link uses
+DOMAIN:9443; in CDN mode it uses the origin IP:9443.
+USAGE
+}
 DOMAIN=""
+SECRET=""
+AD_TAG=""
+HELLO_FLAG_SET=0
+AD_TAG_FLAG_SET=0
 CDN_MODE=0
 ORIGIN_CERT=""
 ORIGIN_KEY=""
 while (( $# )); do
   case "$1" in
-    --cdn) CDN_MODE=1; shift ;;
-    --origin-cert|--origin-key)
-      [[ $# -ge 2 && "$2" != --* ]] || { echo "Missing file path for $1" >&2; exit 1; }
-      if [[ "$1" == --origin-cert ]]; then ORIGIN_CERT="$2"; else ORIGIN_KEY="$2"; fi
-      shift 2 ;;
+    --cdn)
+      CDN_MODE=1
+      shift
+      ;;
+    --domain|--hello|--hello-secret|--ad-tag|--origin-cert|--origin-key)
+      option="$1"
+      if (( $# < 2 )) || [[ -z "$2" || "$2" == --* ]]; then
+        echo "Missing value for $option" >&2
+        exit 1
+      fi
+      value="$2"
+      case "$option" in
+        --domain)
+          [[ -z "$DOMAIN" ]] || { echo 'Domain specified more than once.' >&2; exit 1; }
+          DOMAIN="$value"
+          ;;
+        --hello|--hello-secret)
+          (( HELLO_FLAG_SET == 0 )) || { echo 'hello secret specified more than once.' >&2; exit 1; }
+          SECRET="$value"
+          HELLO_FLAG_SET=1
+          ;;
+        --ad-tag)
+          (( AD_TAG_FLAG_SET == 0 )) || { echo 'ad_tag specified more than once.' >&2; exit 1; }
+          AD_TAG="$value"
+          AD_TAG_FLAG_SET=1
+          ;;
+        --origin-cert)
+          ORIGIN_CERT="$value"
+          ;;
+        --origin-key)
+          ORIGIN_KEY="$value"
+          ;;
+      esac
+      shift 2
+      ;;
     --help|-h)
-      echo 'Usage: sudo bash deploy.sh [domain.example.org] [--cdn --origin-cert /secure/fullchain.pem --origin-key /secure/privkey.pem]'
-      echo 'Direct mode requires DNS pointing to this VPS and issues a certificate on port 80.'
-      echo 'CDN mode requires public DNS plus an existing valid origin certificate/key; it does not issue or renew them.'
-      exit 0 ;;
-    --*) echo "Unknown option: $1" >&2; exit 1 ;;
-    *) [[ -z "$DOMAIN" ]] || { echo 'Only one domain is allowed.' >&2; exit 1; }; DOMAIN="$1"; shift ;;
+      usage
+      exit 0
+      ;;
+    -*)
+      echo "Unknown option: $1" >&2
+      exit 1
+      ;;
+    *)
+      [[ -z "$DOMAIN" ]] || { echo 'Only one domain is allowed.' >&2; exit 1; }
+      DOMAIN="$1"
+      shift
+      ;;
   esac
 done
 if (( CDN_MODE == 0 )) && [[ -n "$ORIGIN_CERT$ORIGIN_KEY" ]]; then
-  echo 'Origin certificate flags require --cdn.' >&2; exit 1
+  echo 'Origin certificate flags require --cdn.' >&2
+  exit 1
 fi
 if [[ -z "$DOMAIN" ]]; then
   if [[ ! -r /dev/tty ]]; then
-    echo 'No terminal available. Pass the domain as the first argument.' >&2
+    echo 'No terminal available. Supply --domain or the positional domain.' >&2
     exit 1
   fi
   read -r -p 'Введите домен WEB-прокси (например, web.example.org): ' DOMAIN </dev/tty || true
@@ -52,6 +113,20 @@ DOMAIN="${DOMAIN,,}"
 if [[ ! "$DOMAIN" =~ ^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$ || "$DOMAIN" != *.* || "$DOMAIN" == *..* ]]; then
   echo 'Invalid domain. Example: web.example.org' >&2
   exit 1
+fi
+if [[ -n "$SECRET" ]]; then
+  if [[ ! "$SECRET" =~ ^[[:xdigit:]]{32}$ ]]; then
+    echo 'Invalid --hello-secret: expected exactly 32 hexadecimal characters, without dd/ee.' >&2
+    exit 1
+  fi
+  SECRET="${SECRET,,}"
+fi
+if [[ -n "$AD_TAG" ]]; then
+  if [[ ! "$AD_TAG" =~ ^[[:xdigit:]]{32}$ ]]; then
+    echo 'Invalid --ad-tag: expected exactly 32 hexadecimal characters.' >&2
+    exit 1
+  fi
+  AD_TAG="${AD_TAG,,}"
 fi
 if [[ ! -f /etc/os-release ]]; then echo 'This installer requires Ubuntu 24.04.' >&2; exit 1; fi
 . /etc/os-release
@@ -231,8 +306,20 @@ if command -v ufw >/dev/null 2>&1 && ufw status | grep -q '^Status: active'; the
   ufw allow 9443/tcp
 fi
 
-SECRET="$(openssl rand -hex 16)"
+if [[ -z "$SECRET" ]]; then
+  SECRET="$(openssl rand -hex 16)"
+  echo '[INFO] Generated new hello secret.'
+else
+  echo '[INFO] Reusing specified hello secret.'
+fi
 if [[ ${#SECRET} -ne 32 ]]; then echo 'Secret generation failed.' >&2; exit 1; fi
+if [[ -n "$AD_TAG" ]]; then echo '[INFO] Using existing sponsored-channel ad_tag.'; fi
+# CDN hostname may not forward TCP 9443 to the origin.
+MTPROTO_HOST="$DOMAIN"
+if (( CDN_MODE == 1 )); then
+  MTPROTO_HOST="$PUBLIC_IP"
+  echo '[INFO] CDN mode: MTProto link uses origin IP:9443, not the CDN hostname.'
+fi
 
 echo '[2/8] Installing latest stable Telemt release and MEKOPR (without upstream Nginx wizard)...'
 INSTALL_SCRIPT="$(mktemp)"
@@ -294,7 +381,7 @@ fi
 cat > /etc/telemt/telemt.toml <<EOF
 [general]
 use_middle_proxy = true
-ad_tag = ""
+ad_tag = "$AD_TAG"
 
 [general.modes]
 classic = true
@@ -303,7 +390,7 @@ tls = true
 
 [general.links]
 show = ["hello"]
-public_host = "$PUBLIC_IP"
+public_host = "$MTPROTO_HOST"
 public_port = 9443
 
 [server]
@@ -532,7 +619,7 @@ cat <<EOF
 ====================== READY ======================
 Web:          https://$DOMAIN/
 WEB proxy:    tg://webproxy?server=$DOMAIN&secret=dd$SECRET
-MTProto:      tg://proxy?server=$PUBLIC_IP&port=9443&secret=dd$SECRET
+MTProto:      tg://proxy?server=$MTPROTO_HOST&port=9443&secret=dd$SECRET
 Config:       /etc/telemt/telemt.toml
 MEKOPR:       mekopr
 ===================================================
