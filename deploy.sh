@@ -24,6 +24,7 @@ Usage: sudo bash deploy.sh [DOMAIN] [OPTIONS]
 
 Options:
   --domain FQDN          Domain for WEB proxy (or positional DOMAIN)
+  --resume               Continue a first installation interrupted at the MEKOPR menu step
   --hello-secret HEX     Reuse hello secret (32 HEX, without dd/ee)
   --hello HEX            Alias for --hello-secret
   --ad-tag HEX           Sponsor tag from @MTProxybot (32 HEX)
@@ -48,6 +49,7 @@ AD_TAG=""
 HELLO_FLAG_SET=0
 AD_TAG_FLAG_SET=0
 CDN_MODE=0
+RESUME_MODE=0
 ORIGIN_CERT=""
 ORIGIN_KEY=""
 WILDCARD_CERT=""
@@ -58,6 +60,10 @@ while (( $# )); do
   case "$1" in
     --wildcard)
       AUTO_WILDCARD=1; shift
+      ;;
+    --resume)
+      RESUME_MODE=1
+      shift
       ;;
     --cdn)
       CDN_MODE=1
@@ -237,9 +243,65 @@ fi
 if [[ ! -f /etc/os-release ]]; then echo 'This installer requires Ubuntu 24.04.' >&2; exit 1; fi
 . /etc/os-release
 if [[ "${ID:-}" != ubuntu || "${VERSION_ID:-}" != 24.04 ]]; then echo 'Supported OS: Ubuntu 24.04 only.' >&2; exit 1; fi
-if [[ -f /etc/telemt/telemt.toml || -e /opt/mtpr-simple/main.sh ]]; then
- echo 'Existing Telemt/MEKOPR installation detected. This installer is for a fresh VPS and will not overwrite it.' >&2
- exit 1
+if (( RESUME_MODE == 1 )); then
+  if (( CDN_MODE == 1 || AUTO_WILDCARD == 1 )) || [[ -n "$ORIGIN_CERT$ORIGIN_KEY$WILDCARD_CERT$WILDCARD_KEY$CERT_MANAGER" ]]; then
+    echo '--resume only supports direct HTTPS without CDN or wildcard options.' >&2
+    exit 1
+  fi
+  [[ -f /etc/telemt/telemt.toml && -f /opt/mtpr-simple/main.sh && -f /opt/mtpr-simple/proxys/telemt1.sh ]] || {
+    echo 'Cannot resume: partial Telemt + MEKOPR installation not found.' >&2; exit 1
+  }
+  [[ ! -e /var/lib/telemt/public/index.html && ! -e "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]] || {
+    echo 'Cannot resume: WEB site or certificate already exists; refusing to overwrite an installed proxy.' >&2; exit 1
+  }
+  [[ -L /etc/nginx/sites-enabled/default ]] &&
+  [[ "$(readlink -f /etc/nginx/sites-enabled/default)" == /etc/nginx/sites-available/default ]] &&
+  [[ -z "$(find /etc/nginx/sites-enabled -mindepth 1 -maxdepth 1 ! -name default -print -quit)" ]] &&
+  [[ -z "$(find /etc/nginx/conf.d -maxdepth 1 -type f -name '*.conf' -print -quit 2>/dev/null)" ]] &&
+  dpkg --verify nginx-common >/dev/null 2>&1 || {
+    echo 'Cannot resume: Nginx is not in its unmodified stock Ubuntu state.' >&2; exit 1
+  }
+  systemctl is-active --quiet telemt || {
+    echo 'Cannot resume: Telemt service is not active.' >&2; exit 1
+  }
+  python3 - "$DOMAIN" <<'PY'
+import sys, tomllib
+with open('/etc/telemt/telemt.toml', 'rb') as f:
+    c = tomllib.load(f)
+if c.get('server', {}).get('port') != 9443:
+    sys.exit('Unexpected Telemt port; refusing to resume.')
+if c.get('web', {}).get('enabled') is not True:
+    sys.exit('WEB was not configured by MEKOPR; refusing to resume.')
+vhosts = c.get('web', {}).get('vhosts', [])
+if len(vhosts) != 1 or vhosts[0].get('host') != sys.argv[1]:
+    sys.exit('Unexpected WEB domain / vhosts; refusing to resume.')
+profiles = vhosts[0].get('profiles', [])
+if len(profiles) != 1 or profiles[0].get('user') != 'hello':
+    sys.exit('Unexpected WEB profile; refusing to resume.')
+print('[OK] Partial MEKOPR WEB configuration verified.')
+PY
+  if [[ -z "$SECRET" ]]; then
+    [[ -r /dev/tty ]] || { echo '--resume requires --hello-secret or interactive terminal.' >&2; exit 1; }
+    read -r -s -p 'Секрет hello (32 HEX, без dd/ee): ' SECRET </dev/tty
+    printf '\n'
+  fi
+  [[ "$SECRET" =~ ^[[:xdigit:]]{32}$ ]] || {
+    echo 'Enter the previous 32-HEX hello secret to resume.' >&2; exit 1
+  }
+  SECRET="$(printf '%s' "$SECRET" | tr 'A-F' 'a-f')"
+  if [[ -z "$AD_TAG" && -r /dev/tty ]]; then
+    read -r -s -p 'ad_tag (32 HEX, Enter = без тега): ' AD_TAG </dev/tty
+    printf '\n'
+  fi
+  [[ -z "$AD_TAG" || "$AD_TAG" =~ ^[[:xdigit:]]{32}$ ]] || {
+    echo 'ad_tag must contain exactly 32 HEX characters.' >&2; exit 1
+  }
+  AD_TAG="$(printf '%s' "$AD_TAG" | tr 'A-F' 'a-f')"
+else
+  if [[ -f /etc/telemt/telemt.toml || -e /opt/mtpr-simple/main.sh ]]; then
+    echo 'Existing Telemt/MEKOPR detected. Use --resume only for our interrupted first installation.' >&2
+    exit 1
+  fi
 fi
 if (( CDN_MODE == 1 )); then
   # The CDN certificate and the origin certificate are separate. Never skip TLS
@@ -388,12 +450,18 @@ if port_occupied 80; then
   fi
 fi
 for p in 80 443 9443 18080; do
-  if port_occupied "$p"; then
-    echo "TCP port $p is occupied. Do not run this installer on a non-fresh server." >&2
-    exit 1
+  if ! port_occupied "$p"; then
+    continue
   fi
+  if (( RESUME_MODE == 1 )) && [[ "$p" == 9443 || "$p" == 18080 ]] &&
+    ss -lntp | awk -v p="$p" '$4 ~ (":" p "$") { found=1; if ($0 !~ /users:\(\("telemt"/) bad=1 } END {exit !(found && !bad)}'; then
+    continue
+  fi
+  echo "TCP port $p is occupied by a service not allowed for this installation." >&2
+  exit 1
 done
 
+if (( RESUME_MODE == 0 )); then
 echo '[1/8] Installing basic dependencies...'
 INSTALLER_NGINX_CLEANUP=1
 export DEBIAN_FRONTEND=noninteractive
@@ -495,6 +563,16 @@ print('[OK] Пункт S исправлен. Ссылка останется н�
 print('[INFO] Резервная копия:', backup)
 PY
 
+
+else
+  echo '[RESUME] Skipping package, Telemt, MEKOPR and SYN FIX installation.'
+  MTPROTO_HOST="$DOMAIN"
+  if command -v ufw >/dev/null 2>&1 && ufw status | grep -q '^Status: active'; then
+    ufw allow 80/tcp
+    ufw allow 443/tcp
+    ufw allow 9443/tcp
+  fi
+fi
 
 [[ -x /usr/local/bin/telemt || -n "$(command -v telemt || :)" ]] || { echo 'Telemt binary missing.' >&2; exit 1; }
 echo "[OK] Installed Telemt release: $(telemt --version 2>/dev/null | head -1 || true)"
