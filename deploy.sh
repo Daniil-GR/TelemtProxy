@@ -522,6 +522,15 @@ if (( CDN_MODE == 1 )); then
 fi
 
 echo '[2/8] Installing latest stable Telemt release and MEKOPR (without upstream Nginx wizard)...'
+# MEKOPR enables the WEB listener before our stage 4 generates its decoy site.
+# Telemt refuses to start if the static directory does not exist yet.
+# Create the real (non-symlink) directory before upstream starts the service.
+if [[ -L /var/lib/telemt/public ]]; then
+  echo 'Unsafe WEB static directory: /var/lib/telemt/public is a symlink.' >&2
+  exit 1
+fi
+install -d -m 755 /var/lib/telemt/public
+echo '[OK] WEB static directory prepared before MEKOPR starts Telemt.'
 INSTALL_SCRIPT="$(mktemp)"
 curl -fsSL --retry 3 https://raw.githubusercontent.com/Mekotofeuka/MTPROTO_FIX_By_MEKO/main/install.sh -o "$INSTALL_SCRIPT"
 # MEKOPR manages Telemt and SYN FIX on 9443. We configure Nginx separately,
