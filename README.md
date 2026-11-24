@@ -2,7 +2,7 @@
 
 Установка Telemt на чистый Ubuntu 24.04 VPS: WEB + MTProto, только MTProto и MTProto для Gcore Edge Proxy.
 
-Основной `deploy.sh` устанавливает WEB + MTProto, MEKOPR, Nginx и сертификат Let's Encrypt, а также создаёт игровую заглушку. Отдельный `deploy-mtproto.sh` устанавливает только MTProto/FakeTLS, без WEB-режима и веб-сервера.
+Основной `deploy.sh` устанавливает WEB + MTProto, MEKOPR, Nginx и сертификат Let's Encrypt, а также создаёт игровую заглушку. Отдельный `deploy-mtproto.sh` устанавливает MTProto/FakeTLS без Telegram WEB Proxy: по умолчанию без веб-сервера, либо с собственной HTTPS-заглушкой в режиме `--selfsteal`.
 
 ## Установка WEB + MTProto
 
@@ -63,7 +63,7 @@ sudo bash /tmp/telemtproxy-install.sh \
 
 ## Быстрая установка только MTProto
 
-Для VPS, где WEB-прокси не нужен, используйте отдельный установщик `deploy-mtproto.sh`. Он не меняет и не вызывает `deploy.sh`.
+Для VPS, где WEB-прокси не нужен, используйте отдельный установщик `deploy-mtproto.sh`. Он не меняет и не вызывает `deploy.sh`. По умолчанию используется внешняя маскировка; для собственной HTTPS-заглушки см. раздел ниже.
 
 Создайте DNS A-запись выбранного поддомена на IP нового VPS, затем выполните:
 
@@ -116,6 +116,41 @@ sudo cat /root/telemt-mtproto-link.txt
 ~~~
 
 Установщик предназначен для **чистого VPS**: он не перезаписывает действующие конфигурации Telemt/MEKOPR и не занимает чужой порт 443. Для Floating IP DNS A-запись должна указывать на адрес интерфейса VPS либо на определяемый внешний IPv4.
+
+## MTProto + собственная HTTPS-заглушка (Nginx)
+
+Для обычного MTProto/FakeTLS с собственной игровой заглушкой используется тот же установщик `deploy-mtproto.sh` с флагом `--selfsteal` (синоним `--nginx`). Telegram WEB Proxy не включается.
+
+На чистом Ubuntu 24.04 VPS предварительно направьте DNS A-запись своего поддомена на IPv4 VPS и разрешите входящие TCP 80 и 443.
+
+~~~bash
+curl -fsSLo /tmp/telemt-mtproto.sh \
+  https://raw.githubusercontent.com/Daniil-GR/TelemtProxy/main/deploy-mtproto.sh
+sudo bash /tmp/telemt-mtproto.sh \
+  --selfsteal \
+  --domain proxy.example.org
+~~~
+
+Опционально передайте `--hello-secret` и `--ad-tag`, как при обычной установке. Если параметры не указаны, установщик запросит их скрыто. Домен в примере условный.
+
+- Telemt принимает MTProto/FakeTLS на публичном TCP 443; пользователь `hello`, секрет в формате `ee` со своим доменом в SNI.
+- Обычный HTTPS-запрос с этим SNI передаётся локальному Nginx на `127.0.0.1:8443`, где размещена та же игровая заглушка с уникальными для установки ресурсами.
+- Nginx не занимает публичный порт 443; порт 8443 не нужно открывать извне.
+- Certbot получает обычный сертификат Let's Encrypt через HTTP-01 на TCP 80; продление выполняется через `certbot.timer`, после успешного продления Nginx перечитывает сертификат.
+- Проверяется HTTPS через публичный listener Telemt, доверие сертификату и доступность ресурсов сайта. Telegram-подключение дополнительно проверяется клиентом.
+
+Проверка после установки:
+
+~~~bash
+systemctl is-active telemt nginx
+ss -lntp | grep -E ':(443|8443)\b'
+curl -fsSI https://proxy.example.org/
+sudo certbot renew --dry-run
+~~~
+
+**Важно:** в новом режиме FakeTLS использует собственный домен вместо `www.booking.com`. При смене SNI меняется содержимое `ee`-ссылки, даже если секрет hello сохранён. Для сохранения уже распространённой ссылки повторно используйте тот же режим и домен. Сертификат выпускается на конкретный домен и будет опубликован в CT. Wildcard в этом режиме пока не поддерживается.
+
+Установка без `--selfsteal` по-прежнему использует `www.booking.com` и не устанавливает Nginx/Certbot. Режим `--edge-proxy` не изменён; сочетать его с `--selfsteal` нельзя.
 
 ## MTProto для Edge Proxy (Gcore)
 
