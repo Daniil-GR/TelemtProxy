@@ -209,7 +209,7 @@ if (( EDGE_MODE == 1 )); then
   else
     curl -fsSL --retry 3 --max-time 30 https://raw.githubusercontent.com/Daniil-GR/TelemtProxy/main/gcore-edge.py -o "$TEMP_EDGE_HELPER"
   fi
-  EXPECTED_EDGE_SHA256="e278c2418af4a04baa86925387c22751981084d27477219439415fe167fa8034"
+  EXPECTED_EDGE_SHA256="ea29cd23d09cd6744738e181cffe3fbcb54690ee3ca4d2caebfb4aaddaf2aa42"
   [[ "$(sha256sum "$TEMP_EDGE_HELPER" | awk '{print $1}')" == "$EXPECTED_EDGE_SHA256" ]] || {
     echo 'Edge helper checksum mismatch. Download the current installer again.' >&2; exit 1;
   }
@@ -751,3 +751,4 @@ Origin VPS: $PUBLIC_IP:443 (TCP)
 ============================================================
 EOF
 fi
+
