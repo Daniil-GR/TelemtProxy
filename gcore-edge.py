@@ -222,9 +222,7 @@ def install(cidrs):
     atomic(CONFIG, updated)
     for path, content in units().items():
         atomic(Path(path), content, 0o644)
-    run("systemctl", "daemon-reload")
-    run("systemctl", "enable", "--now", "telemt-gcore-firewall.service")
-    run("systemctl", "enable", "--now", "telemt-gcore-refresh.timer")
+
 
 
 def refresh():
@@ -269,6 +267,10 @@ def main():
             firewall(networks(json.loads(CACHE.read_text())))
         else:
             refresh()
+    if args.action == "install":
+        run("systemctl", "daemon-reload")
+        run("systemctl", "enable", "--now", "telemt-gcore-firewall.service")
+        run("systemctl", "enable", "--now", "telemt-gcore-refresh.timer")
 
 
 if __name__ == "__main__":
