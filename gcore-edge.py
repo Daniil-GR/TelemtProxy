@@ -48,7 +48,13 @@ def fetch():
         data = response.read(2_000_001)
         if len(data) > 2_000_000:
             raise ValueError("Oversized Gcore response")
-    return networks(json.loads(data))
+    values = json.loads(data)
+    addresses = values["addresses"] if isinstance(values, dict) else values
+    if not isinstance(addresses, list) or len(addresses) > 16384:
+        raise ValueError("Invalid Gcore network list")
+    # The public feed can include this internal Gcore range. It must never
+    # enter the firewall allowlist or the PROXY protocol trust configuration.
+    return networks([value for value in addresses if value != "172.31.0.0/16"])
 
 
 def patch_config(text, cidrs):
@@ -216,9 +222,7 @@ def install(cidrs):
     atomic(CONFIG, updated)
     for path, content in units().items():
         atomic(Path(path), content, 0o644)
-    run("systemctl", "daemon-reload")
-    run("systemctl", "enable", "--now", "telemt-gcore-firewall.service")
-    run("systemctl", "enable", "--now", "telemt-gcore-refresh.timer")
+
 
 
 def refresh():
@@ -263,6 +267,10 @@ def main():
             firewall(networks(json.loads(CACHE.read_text())))
         else:
             refresh()
+    if args.action == "install":
+        run("systemctl", "daemon-reload")
+        run("systemctl", "enable", "--now", "telemt-gcore-firewall.service")
+        run("systemctl", "enable", "--now", "telemt-gcore-refresh.timer")
 
 
 if __name__ == "__main__":

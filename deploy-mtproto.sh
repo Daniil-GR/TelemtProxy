@@ -117,10 +117,6 @@ while (($# > 0)); do
   esac
 done
 
-if (( SELFSTEAL_MODE == 1 && EDGE_MODE == 1 )); then
-  echo '--selfsteal cannot be combined with --edge-proxy.' >&2
-  exit 1
-fi
 
 if [[ "$EUID" -ne 0 ]]; then
   echo 'Run as root: sudo bash deploy-mtproto.sh [proxy.example.org]' >&2
@@ -169,7 +165,9 @@ if ss -lntH | awk -v port="$PORT" '$4 ~ (":" port "$") {found=1} END {exit !foun
 fi
 
 if (( SELFSTEAL_MODE == 1 )); then
-  for p in 80 "$MASK_PORT"; do
+  SELFSTEAL_PORTS=("$MASK_PORT")
+  if (( EDGE_MODE == 0 )); then SELFSTEAL_PORTS+=(80); fi
+  for p in "${SELFSTEAL_PORTS[@]}"; do
     if ss -lntH | awk -v port="$p" '$4 ~ (":" port "$") {found=1} END {exit !found}'; then
       echo "TCP port $p is occupied; refusing to replace an existing service." >&2
       exit 1
@@ -182,14 +180,36 @@ if (( SELFSTEAL_MODE == 1 )); then
 fi
 
 if (( EDGE_MODE == 1 )); then
+  if (( SELFSTEAL_MODE == 1 )); then
+    CERT_DIR="/etc/letsencrypt/live/$DOMAIN"
+    if [[ ! -s "$CERT_DIR/fullchain.pem" || ! -s "$CERT_DIR/privkey.pem" ]]; then
+      echo "Combined mode requires a trusted DNS-01 certificate in $CERT_DIR before installation." >&2
+      exit 1
+    fi
+    leaf="$(mktemp)"
+    if ! openssl x509 -in "$CERT_DIR/fullchain.pem" -out "$leaf" ||
+       ! openssl x509 -in "$leaf" -noout -checkend 86400 ||
+       ! openssl verify -purpose sslserver -verify_hostname "$DOMAIN" -untrusted "$CERT_DIR/fullchain.pem" "$leaf" ||
+       [[ "$(openssl x509 -in "$leaf" -pubkey -noout)" != "$(openssl pkey -in "$CERT_DIR/privkey.pem" -passin pass: -pubout)" ]]; then
+      rm -- "$leaf"
+      echo 'Invalid, expiring or mismatched HTTPS certificate.' >&2
+      exit 1
+    fi
+    rm -- "$leaf"
+  fi
   echo '[1/5] Preparing Gcore Edge mode (public DNS may point to Edge IP or be absent)...'
   for path in /etc/telemt/gcore-edge-cidrs.json /usr/local/lib/telemtproxy/gcore-edge.py /etc/systemd/system/telemt-gcore-firewall.service; do
     [[ ! -e "$path" ]] || { echo "Existing Edge setup: $path. Use a fresh VPS." >&2; exit 1; }
   done
   TEMP_EDGE_HELPER="$(mktemp)"
   TEMP_EDGE_CIDRS="$(mktemp)"
-  curl -fsSL --retry 3 --max-time 30 https://raw.githubusercontent.com/Daniil-GR/TelemtProxy/main/gcore-edge.py -o "$TEMP_EDGE_HELPER"
-  EXPECTED_EDGE_SHA256="e278c2418af4a04baa86925387c22751981084d27477219439415fe167fa8034"
+  EDGE_HELPER_SOURCE="$(dirname -- "${BASH_SOURCE[0]}")/gcore-edge.py"
+  if [[ -f "$EDGE_HELPER_SOURCE" ]]; then
+    cp -- "$EDGE_HELPER_SOURCE" "$TEMP_EDGE_HELPER"
+  else
+    curl -fsSL --retry 3 --max-time 30 https://raw.githubusercontent.com/Daniil-GR/TelemtProxy/main/gcore-edge.py -o "$TEMP_EDGE_HELPER"
+  fi
+  EXPECTED_EDGE_SHA256="46133beb0c991c9ccb2d7d9f27f0fb0d72406debbce68e4e8e16d0468cee149b"
   [[ "$(sha256sum "$TEMP_EDGE_HELPER" | awk '{print $1}')" == "$EXPECTED_EDGE_SHA256" ]] || {
     echo 'Edge helper checksum mismatch. Download the current installer again.' >&2; exit 1;
   }
@@ -279,12 +299,14 @@ if (( SELFSTEAL_MODE == 1 )); then
   echo '[SELFSTEAL] Installing Nginx and Certbot for the local HTTPS site...'
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-  apt-get install -y -qq nginx certbot ca-certificates openssl
+  apt-get -o DPkg::Lock::Timeout=120 install -y -qq nginx certbot ca-certificates openssl
   # Nginx may be automatically started with its default port 80 server.
   systemctl stop nginx
   if command -v ufw >/dev/null 2>&1 && ufw status | grep -q '^Status: active'; then
-    ufw allow 80/tcp
-    ufw allow 443/tcp
+    if (( EDGE_MODE == 0 )); then
+      ufw allow 80/tcp
+      ufw allow 443/tcp
+    fi
   fi
   install -d -m 755 /var/www/telemtproxy
   SITE_ZIP="$(mktemp --suffix=.zip)"
@@ -476,9 +498,11 @@ print('[OK] Asset size:',sum((public/n).stat().st_size for n in needed),'bytes')
 PY
   rm -f "$SITE_ZIP"
   SITE_ZIP=""
-  echo '[SELFSTEAL] Obtaining ordinary HTTPS certificate (HTTP-01)...'
-  certbot certonly --standalone --preferred-challenges http -d "$DOMAIN" \
-    --non-interactive --agree-tos --register-unsafely-without-email --keep-until-expiring
+  if (( EDGE_MODE == 0 )); then
+    echo '[SELFSTEAL] Obtaining ordinary HTTPS certificate (HTTP-01)...'
+    certbot certonly --standalone --preferred-challenges http -d "$DOMAIN" \
+      --non-interactive --agree-tos --register-unsafely-without-email --keep-until-expiring
+  fi
   cat > /etc/nginx/sites-available/default <<EOF
 server {
     listen 127.0.0.1:8443 ssl http2;
@@ -525,7 +549,7 @@ if (( EDGE_MODE == 1 )); then
   FIX_ARGS=(-no-fix)
   command -v apt-get >/dev/null || { echo 'apt-get is required.' >&2; exit 1; }
   DEBIAN_FRONTEND=noninteractive apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y iptables ipset
+  DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y iptables ipset
 else
   echo '[2/5] Installing Telemt (latest stable) and MEKOPR SYN FIX v3...'
   FIX_ARGS=(-fix -fix-type v3)
@@ -653,7 +677,7 @@ if (( READY == 0 )); then
 fi
 echo '[OK] Telemt service active and TCP 443 is listening.'
 
-if (( SELFSTEAL_MODE == 1 )); then
+if (( SELFSTEAL_MODE == 1 && EDGE_MODE == 0 )); then
   # A real HTTPS request through the public MTProto listener must reach Nginx.
   SITE_BODY="$(curl -4 -fsS --noproxy '*' --connect-timeout 5 --max-time 15 \
     --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/")"
@@ -698,7 +722,12 @@ EOF
 
 if (( SELFSTEAL_MODE == 1 )); then
   echo "HTTPS site: https://$DOMAIN/"
-  echo 'Nginx: 127.0.0.1:8443; Certbot renewal via systemd timer on port 80.'
+  echo 'Nginx listens on 127.0.0.1:8443.'
+  if (( EDGE_MODE == 1 )); then
+    echo 'Verify public HTTPS through Gcore after activation. Keep the DNS-01 renewal configured.'
+  else
+    echo 'Certbot renews via HTTP-01 on port 80.'
+  fi
   echo 'Verify actual MTProto connectivity in Telegram using the generated ee link.'
 else
   echo 'No Nginx or Certbot configured.'
@@ -722,3 +751,4 @@ Origin VPS: $PUBLIC_IP:443 (TCP)
 ============================================================
 EOF
 fi
+

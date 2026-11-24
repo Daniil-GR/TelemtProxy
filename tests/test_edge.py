@@ -237,9 +237,8 @@ class EdgeTests(unittest.TestCase):
                 )
                 self.assertEqual(helper.stat().st_mode & 0o777, 0o700)
                 self.assertEqual(cache.stat().st_mode & 0o777, 0o600)
-                self.assertEqual(
-                    run.call_args_list[0].args, ("systemctl", "daemon-reload")
-                )
+                # Writing configuration under the lock must not start a service.
+                run.assert_not_called()
                 before = config.read_text()
                 with self.assertRaises(ValueError):
                     edge.install(CIDRS)
