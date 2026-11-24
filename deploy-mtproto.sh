@@ -299,7 +299,7 @@ if (( SELFSTEAL_MODE == 1 )); then
   echo '[SELFSTEAL] Installing Nginx and Certbot for the local HTTPS site...'
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-  apt-get install -y -qq nginx certbot ca-certificates openssl
+  apt-get -o DPkg::Lock::Timeout=120 install -y -qq nginx certbot ca-certificates openssl
   # Nginx may be automatically started with its default port 80 server.
   systemctl stop nginx
   if command -v ufw >/dev/null 2>&1 && ufw status | grep -q '^Status: active'; then
@@ -549,7 +549,7 @@ if (( EDGE_MODE == 1 )); then
   FIX_ARGS=(-no-fix)
   command -v apt-get >/dev/null || { echo 'apt-get is required.' >&2; exit 1; }
   DEBIAN_FRONTEND=noninteractive apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y iptables ipset
+  DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=120 install -y iptables ipset
 else
   echo '[2/5] Installing Telemt (latest stable) and MEKOPR SYN FIX v3...'
   FIX_ARGS=(-fix -fix-type v3)
