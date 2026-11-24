@@ -150,7 +150,7 @@ sudo certbot renew --dry-run
 
 **Важно:** в новом режиме FakeTLS использует собственный домен вместо `www.booking.com`. При смене SNI меняется содержимое `ee`-ссылки, даже если секрет hello сохранён. Для сохранения уже распространённой ссылки повторно используйте тот же режим и домен. Сертификат выпускается на конкретный домен и будет опубликован в CT. Wildcard в этом режиме пока не поддерживается.
 
-Установка без `--selfsteal` по-прежнему использует `www.booking.com` и не устанавливает Nginx/Certbot. Режим `--edge-proxy` не изменён; сочетать его с `--selfsteal` нельзя.
+Установка без `--selfsteal` по-прежнему использует `www.booking.com` и не устанавливает Nginx/Certbot. 
 
 ## MTProto для Edge Proxy (Gcore)
 
@@ -220,6 +220,18 @@ sudo systemctl start telemt-gcore-refresh.service
 
 Документация: [Gcore: настройка и список origin-адресов](https://github.com/G-Core/product-documentation/blob/main/edge-proxy/setup-and-configuration.mdx),
 [Telemt: PROXY protocol](https://github.com/telemt/telemt/blob/main/src/config/types/server.rs).
+
+### Edge Proxy с собственной HTTPS-заглушкой
+
+На чистом Ubuntu 24.04 предварительно подготовьте доверенный сертификат для клиентского имени через DNS-01 и разместите полную цепочку и закрытый ключ в `/etc/letsencrypt/live/ИМЯ/` как `fullchain.pem` и `privkey.pem`. Закрытый ключ храните с правами 600. Настройте продление тем же DNS-01-клиентом и reload Nginx после обновления.
+
+```bash
+sudo bash deploy-mtproto.sh --edge-proxy --selfsteal --domain proxy.example.org
+```
+
+Для приватного репозитория предварительно скачайте `deploy-mtproto.sh` и `gcore-edge.py` из одного коммита в один каталог через авторизованный GitHub. Установщик проверяет контрольную сумму помощника.
+
+A-запись направьте на Edge IP. На Gcore включите Generic TCP Server на 443 с PROXY protocol V1. Telemt использует свой домен для FakeTLS, а Nginx обслуживает HTTPS на локальном 8443. Проверку публичного HTTPS и передачи сообщений выполните после активации Edge.
 
 ## WEB через CDN
 
