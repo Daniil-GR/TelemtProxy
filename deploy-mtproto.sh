@@ -10,6 +10,8 @@ TEMP_EDGE_HELPER=""
 TEMP_EDGE_CIDRS=""
 EDGE_MODE=0
 SELFSTEAL_MODE=0
+SYNLIMIT=0
+SYNLIMIT_LINE=""
 MASK_PORT=8443
 MASK_SETTINGS=""
 TLS_CERT=""
@@ -45,6 +47,7 @@ usage() {
 Usage: sudo bash deploy-mtproto.sh [DOMAIN] [OPTIONS]
 
 Options:
+  --synlimit            Enable built-in Telemt SYN limiting (iptables; replaces external SYN FIX)
   --selfsteal           MTProto + own Nginx HTTPS runner site, without WEB Proxy
   --nginx               Alias for --selfsteal
   --cert-manager URL   HTTPS origin of certificate manager (with --selfsteal)
@@ -75,6 +78,11 @@ while (($# > 0)); do
     -h|--help)
       usage
       exit 0
+      ;;
+    --synlimit)
+      SYNLIMIT=1
+      SYNLIMIT_LINE='synlimit = "iptables"'
+      shift
       ;;
     --selfsteal|--nginx)
       SELFSTEAL_MODE=1
@@ -157,6 +165,9 @@ if [[ -n "$TLS_CERT$TLS_KEY" ]]; then
     exit 1
   fi
   SHARED_TLS=1
+fi
+if (( SYNLIMIT == 1 && EDGE_MODE == 1 )); then
+  echo '--synlimit is not supported with --edge-proxy (shared Edge source IPs).' >&2; exit 1
 fi
 if (( SELFSTEAL_MODE == 1 && EDGE_MODE == 1 )); then
   echo '--selfsteal cannot be combined with --edge-proxy.' >&2
@@ -631,6 +642,11 @@ if (( EDGE_MODE == 1 )); then
   command -v apt-get >/dev/null || { echo 'apt-get is required.' >&2; exit 1; }
   DEBIAN_FRONTEND=noninteractive apt-get update
   DEBIAN_FRONTEND=noninteractive apt-get install -y iptables ipset
+elif (( SYNLIMIT == 1 )); then
+  echo '[2/5] Installing Telemt with built-in SYN limiting (no external SYN FIX)...'
+  DEBIAN_FRONTEND=noninteractive apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y iptables
+  FIX_ARGS=(-no-fix)
 else
   echo '[2/5] Installing Telemt (latest stable) and MEKOPR SYN FIX v3...'
   FIX_ARGS=(-fix -fix-type v3)
@@ -681,6 +697,7 @@ whitelist = ["127.0.0.1/32"]
 [[server.listeners]]
 ip = "0.0.0.0"
 port = $PORT
+$SYNLIMIT_LINE
 
 [censorship]
 tls_domain = "$MASK_DOMAIN"
@@ -733,6 +750,97 @@ After=nginx.service
 UNIT
   systemctl daemon-reload
 fi
+
+# Match MEKOPR's Basic optimization profile, preserving its rollback layout.
+# Apply after the final Telemt configuration (including any Edge settings) is written.
+if (( SYNLIMIT == 1 )); then
+  # Telemt owns its firewall rules and needs CAP_NET_ADMIN at startup.
+  install -d -m 755 /etc/systemd/system/telemt.service.d
+  cat > /etc/systemd/system/telemt.service.d/20-telemtproxy-synlimit.conf <<'SYNUNIT'
+[Service]
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+SYNUNIT
+  echo '[INFO] Built-in Telemt SYN limit enabled (iptables).'
+else
+  echo '[INFO] Built-in Telemt SYN limit disabled.'
+fi
+
+echo '[OPT] Applying MEKOPR basic optimization...'
+(
+  set -Eeuo pipefail
+  umask 077
+  snapshot=/opt/mtpr-simple/opt-snapshot
+  cfg=/etc/telemt/telemt.toml
+  sysctl_file=/etc/sysctl.d/99-custom.conf
+  limits=/etc/systemd/system/telemt.service.d/limits.conf
+  if [[ -e "$snapshot" || -L "$snapshot" ]]; then
+    echo '[ERROR] Existing MEKOPR optimization snapshot; refusing to overwrite it.' >&2
+    exit 1
+  fi
+  install -d -m 700 "$snapshot"
+  if [[ -f "$sysctl_file" ]]; then
+    cp -a "$sysctl_file" "$snapshot/sysctl.conf"
+  else
+    touch "$snapshot/sysctl.absent"
+  fi
+  if [[ -f "$limits" ]]; then
+    cp -a "$limits" "$snapshot/limits.conf"
+  else
+    touch "$snapshot/limits.absent"
+  fi
+  install -m 600 "$cfg" "$snapshot/telemt.toml"
+  printf '%s\n' "$cfg" > "$snapshot/telemt.path"
+  date '+%Y-%m-%d %H:%M:%S' > "$snapshot/created_at"
+  python3 - "$cfg" <<'BASIC_OPT'
+import pathlib, re, sys, tomllib
+p = pathlib.Path(sys.argv[1])
+s = p.read_text()
+c = tomllib.loads(s)
+if "max_connections" in c["server"]:
+    s, count = re.subn(r"(?m)^max_connections[ \t]*=.*$", "max_connections = 16384", s)
+    assert count == 1
+else:
+    s, count = re.subn(r"(?m)^\[server\][ \t]*$", "[server]\nmax_connections = 16384", s)
+    assert count == 1
+# The upstream menu updates client_handshake only if already present.
+s = re.sub(r"(?m)^client_handshake[ \t]*=.*$", "client_handshake = 15", s)
+assert tomllib.loads(s)["server"]["max_connections"] == 16384
+p.write_text(s)
+BASIC_OPT
+  install -d -m 755 /etc/systemd/system/telemt.service.d
+  cat > "$limits" <<'OPT_LIMITS'
+[Service]
+LimitNOFILE=65535
+OPT_LIMITS
+  chmod 644 "$limits"
+  cat > "$sysctl_file" <<'OPT_SYSCTL'
+net.ipv4.tcp_fastopen=3
+net.core.somaxconn=65535
+net.ipv4.tcp_max_syn_backlog=65535
+net.core.netdev_max_backlog=65535
+fs.file-max=2097152
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.ipv4.tcp_keepalive_time=45
+net.ipv4.tcp_keepalive_intvl=15
+net.ipv4.tcp_keepalive_probes=3
+OPT_SYSCTL
+  chmod 644 "$sysctl_file"
+  modprobe tcp_bbr 2>/dev/null || true
+  # Do not reapply unrelated sysctl configuration on the host.
+  if ! sysctl -p "$sysctl_file"; then
+    echo '[WARN] Kernel refused one or more basic optimization settings; review output.' >&2
+  fi
+  systemctl daemon-reload
+  if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)" == bbr &&
+        "$(sysctl -n net.core.default_qdisc 2>/dev/null || true)" == fq &&
+        "$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || true)" == 3 ]]; then
+    echo '[OK] Basic optimization applied: BBR, fq, TCP Fast Open.'
+  else
+    echo '[WARN] Basic optimization only partially applied; kernel settings differ.' >&2
+  fi
+)
 
 echo '[4/5] Restarting Telemt and waiting for TCP 443...'
 if ! systemctl restart telemt; then
