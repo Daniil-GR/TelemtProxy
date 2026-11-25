@@ -9,6 +9,6 @@ jobs:
         with:
           python-version: '3.12'
       - run: bash -n deploy.sh && bash -n deploy-mtproto.sh && bash -n dns01-dynadot.sh
-      - run: python -m py_compile gcore-edge.py wildcard.py
+      - run: python -m py_compile gcore-edge.py wildcard.py certificate-client.py
       - run: sudo "$(which python)" -m unittest discover -s tests -v
 
