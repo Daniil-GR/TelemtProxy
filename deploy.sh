@@ -24,8 +24,8 @@ Usage: sudo bash deploy.sh [DOMAIN] [OPTIONS]
 
 Options:
   --domain FQDN          Domain for WEB proxy (or positional DOMAIN)
-  --synlimit            Enable built-in Telemt SYN limiting (default for direct installs)
-  --no-synlimit         Disable both SYN filters
+  --synlimit            Enable built-in Telemt SYN limiting (opt-in)
+  --no-synlimit         Disable both SYN filters (default)
   --synfix              Use external MEKOPR SYN FIX v3 instead of built-in limiting
   --resume               Continue a first installation interrupted at the MEKOPR menu step
   --hello-secret HEX     Reuse hello secret (32 HEX, without dd/ee)
@@ -53,8 +53,8 @@ HELLO_FLAG_SET=0
 AD_TAG_FLAG_SET=0
 CDN_MODE=0
 RESUME_MODE=0
-SYNLIMIT=1
-SYNLIMIT_LINE='synlimit = "iptables"'
+SYNLIMIT=0
+SYNLIMIT_LINE=""
 SYN_MODE_EXPLICIT=0
 SYNFIX=0
 ORIGIN_CERT=""
