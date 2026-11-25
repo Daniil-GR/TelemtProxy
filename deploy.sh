@@ -24,7 +24,9 @@ Usage: sudo bash deploy.sh [DOMAIN] [OPTIONS]
 
 Options:
   --domain FQDN          Domain for WEB proxy (or positional DOMAIN)
-  --synlimit            Enable built-in Telemt SYN limiting (iptables; replaces external SYN FIX)
+  --synlimit            Enable built-in Telemt SYN limiting (default for direct installs)
+  --no-synlimit         Disable both SYN filters
+  --synfix              Use external MEKOPR SYN FIX v3 instead of built-in limiting
   --resume               Continue a first installation interrupted at the MEKOPR menu step
   --hello-secret HEX     Reuse hello secret (32 HEX, without dd/ee)
   --hello HEX            Alias for --hello-secret
@@ -51,8 +53,10 @@ HELLO_FLAG_SET=0
 AD_TAG_FLAG_SET=0
 CDN_MODE=0
 RESUME_MODE=0
-SYNLIMIT=0
-SYNLIMIT_LINE=""
+SYNLIMIT=1
+SYNLIMIT_LINE='synlimit = "iptables"'
+SYN_MODE_EXPLICIT=0
+SYNFIX=0
 ORIGIN_CERT=""
 ORIGIN_KEY=""
 WILDCARD_CERT=""
@@ -64,9 +68,18 @@ while (( $# )); do
     --wildcard)
       AUTO_WILDCARD=1; shift
       ;;
-    --synlimit)
-      SYNLIMIT=1
-      SYNLIMIT_LINE='synlimit = "iptables"'
+    --synlimit|--no-synlimit|--synfix)
+      if (( SYN_MODE_EXPLICIT == 1 )); then
+        echo 'Specify only one SYN filter option.' >&2; exit 1
+      fi
+      SYN_MODE_EXPLICIT=1
+      SYNLIMIT=0
+      SYNFIX=0
+      SYNLIMIT_LINE=""
+      case "$1" in
+        --synlimit) SYNLIMIT=1; SYNLIMIT_LINE='synlimit = "iptables"' ;;
+        --synfix) SYNFIX=1 ;;
+      esac
       shift
       ;;
     --resume)
@@ -132,8 +145,12 @@ while (( $# )); do
       ;;
   esac
 done
-if (( SYNLIMIT == 1 && RESUME_MODE == 1 )); then
-  echo '--synlimit is not supported with --resume (existing SYN FIX).' >&2; exit 1
+if (( RESUME_MODE == 1 )); then
+  if (( SYN_MODE_EXPLICIT == 1 )); then
+    echo 'SYN filter options are not supported with --resume; existing external rules are preserved.' >&2; exit 1
+  fi
+  SYNLIMIT=0
+  SYNLIMIT_LINE=""
 fi
 if (( AUTO_WILDCARD == 1 )); then
   if (( CDN_MODE == 1 )) || [[ -n "$WILDCARD_CERT$WILDCARD_KEY$ORIGIN_CERT$ORIGIN_KEY" ]]; then
@@ -544,10 +561,11 @@ install -d -m 755 /var/lib/telemt/public
 echo '[OK] WEB static directory prepared before MEKOPR starts Telemt.'
 INSTALL_SCRIPT="$(mktemp)"
 curl -fsSL --retry 3 https://raw.githubusercontent.com/Mekotofeuka/MTPROTO_FIX_By_MEKO/main/install.sh -o "$INSTALL_SCRIPT"
-FIX_ARGS=(-fix -fix-type v3)
-if (( SYNLIMIT == 1 )); then
+FIX_ARGS=(-no-fix)
+if (( SYNFIX == 1 )); then
+  FIX_ARGS=(-fix -fix-type v3)
+elif (( SYNLIMIT == 1 )); then
   apt-get install -y -qq iptables
-  FIX_ARGS=(-no-fix)
 fi
 # MEKOPR manages Telemt and optional SYN FIX on 9443. We configure Nginx separately,
 # because MEKOPR's install.sh has been observed to ignore failed nginx restarts.
