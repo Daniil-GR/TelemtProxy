@@ -14,6 +14,9 @@ MASK_PORT=8443
 MASK_SETTINGS=""
 TLS_CERT=""
 TLS_KEY=""
+CERT_MANAGER=""
+CERT_TOKEN=""
+MANAGED_TLS=0
 SHARED_TLS=0
 SITE_ZIP=""
 EDGE_OWNED_INSTALL=0
@@ -44,6 +47,8 @@ Usage: sudo bash deploy-mtproto.sh [DOMAIN] [OPTIONS]
 Options:
   --selfsteal           MTProto + own Nginx HTTPS runner site, without WEB Proxy
   --nginx               Alias for --selfsteal
+  --cert-manager URL   HTTPS origin of certificate manager (with --selfsteal)
+  --cert-token KEY     Per-node access key (omit for hidden prompt)
   --tls-cert FILE       Existing trusted TLS fullchain (with --selfsteal)
   --tls-key FILE        Matching private key; renewal managed externally
   --edge-proxy          MTProto for Gcore Edge Proxy (TCP 443, PROXY protocol v1/v2)
@@ -79,7 +84,7 @@ while (($# > 0)); do
       EDGE_MODE=1
       shift
       ;;
-    --domain|--hello|--hello-secret|--ad-tag|--tls-cert|--tls-key)
+    --domain|--hello|--hello-secret|--ad-tag|--tls-cert|--tls-key|--cert-manager|--cert-token)
       option="$1"
       if (($# < 2)); then
         echo "Missing value for $option" >&2
@@ -96,6 +101,14 @@ while (($# > 0)); do
           if [[ -z "$value" ]]; then echo 'Empty hello flag is invalid; omit it for generation.' >&2; exit 1; fi
           SECRET="$value"
           HELLO_FLAG_SET=1
+          ;;
+        --cert-manager)
+          [[ -z "$CERT_MANAGER" && -n "$value" && "$value" != --* ]] || { echo 'Invalid or duplicate --cert-manager.' >&2; exit 1; }
+          CERT_MANAGER="$value"
+          ;;
+        --cert-token)
+          [[ -z "$CERT_TOKEN" && "$value" =~ ^[A-Za-z0-9_-]{43}$ ]] || { echo 'Invalid or duplicate --cert-token.' >&2; exit 1; }
+          CERT_TOKEN="$value"
           ;;
         --tls-cert)
           [[ -z "$TLS_CERT" && -n "$value" ]] || { echo 'Invalid or duplicate --tls-cert.' >&2; exit 1; }
@@ -130,6 +143,14 @@ while (($# > 0)); do
   esac
 done
 
+if [[ -n "$CERT_MANAGER$CERT_TOKEN" ]]; then
+  if (( SELFSTEAL_MODE != 1 )) || [[ -z "$CERT_MANAGER" || -n "$TLS_CERT$TLS_KEY" ]]; then
+    echo 'Managed TLS requires --selfsteal --cert-manager URL and cannot use TLS file flags.' >&2
+    exit 1
+  fi
+  MANAGED_TLS=1
+  SHARED_TLS=1
+fi
 if [[ -n "$TLS_CERT$TLS_KEY" ]]; then
   if (( SELFSTEAL_MODE != 1 )) || [[ -z "$TLS_CERT" || -z "$TLS_KEY" ]]; then
     echo '--tls-cert and --tls-key must be supplied together with --selfsteal.' >&2
@@ -173,7 +194,16 @@ if [[ "$ID" != ubuntu || "$VERSION_ID" != '24.04' ]]; then
   echo 'Supported OS: Ubuntu 24.04 only.' >&2
   exit 1
 fi
-if (( SHARED_TLS == 1 )); then
+if (( MANAGED_TLS == 1 )); then
+  python3 - "$CERT_MANAGER" <<'MANAGER_URL'
+import sys
+from urllib.parse import urlsplit
+p = urlsplit(sys.argv[1])
+if p.scheme != "https" or not p.hostname or p.username or p.password or p.query or p.fragment or p.path not in ("", "/"):
+    sys.exit("Certificate manager must be an HTTPS origin without credentials, path or query")
+MANAGER_URL
+fi
+if (( SHARED_TLS == 1 && MANAGED_TLS == 0 )); then
   [[ "$TLS_CERT" == /* && "$TLS_KEY" == /* && -s "$TLS_CERT" && -s "$TLS_KEY" ]] || {
     echo 'Supply absolute paths to the existing certificate and key.' >&2; exit 1;
   }
@@ -522,7 +552,23 @@ print('[OK] Asset size:',sum((public/n).stat().st_size for n in needed),'bytes')
 PY
   rm -f "$SITE_ZIP"
   SITE_ZIP=""
-  if (( SHARED_TLS == 1 )); then
+  if (( MANAGED_TLS == 1 )); then
+    echo '[SELFSTEAL] Retrieving centrally managed certificate.'
+    install -d -m 755 /usr/local/lib/telemtproxy
+    TEMP_INSTALLER="$(mktemp)"
+    curl -fsSL --retry 3 --max-time 30 \
+      https://raw.githubusercontent.com/Daniil-GR/TelemtProxy/b94479671677636161d99dac60706bab3cd60d93/certificate-client.py \
+      -o "$TEMP_INSTALLER"
+    python3 -m py_compile "$TEMP_INSTALLER"
+    install -m 644 "$TEMP_INSTALLER" /usr/local/lib/telemtproxy/certificate-client.py
+    rm -f "$TEMP_INSTALLER"
+    TEMP_INSTALLER=""
+    TELEMTPROXY_CERT_TOKEN="$CERT_TOKEN" python3 /usr/local/lib/telemtproxy/certificate-client.py setup \
+      --manager "$CERT_MANAGER" --domain "$DOMAIN"
+    unset CERT_TOKEN
+    TLS_CERT_PATH=/var/lib/telemtproxy/certificate-client/current/fullchain.pem
+    TLS_KEY_PATH=/var/lib/telemtproxy/certificate-client/current/privkey.pem
+  elif (( SHARED_TLS == 1 )); then
     echo '[SELFSTEAL] Using supplied TLS certificate; no ACME issuance on this VPS.'
     install -d -m 700 /etc/telemtproxy/shared-tls
     TLS_CERT_PATH=/etc/telemtproxy/shared-tls/fullchain.pem
@@ -723,6 +769,9 @@ if (( SELFSTEAL_MODE == 1 )); then
   curl -4 -fsS --noproxy '*' --connect-timeout 5 --max-time 15 --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/game.js" -o /dev/null
   curl -4 -fsS --noproxy '*' --connect-timeout 5 --max-time 15 --resolve "$DOMAIN:443:127.0.0.1" "https://$DOMAIN/style.css" -o /dev/null
   echo '[OK] HTTPS through Telemt verified: certificate, game and CSS/JS.'
+  if (( MANAGED_TLS == 1 )); then
+    python3 /usr/local/lib/telemtproxy/certificate-client.py enable
+  fi
 fi
 
 if (( EDGE_MODE == 1 )); then
@@ -757,7 +806,10 @@ EOF
 
 if (( SELFSTEAL_MODE == 1 )); then
   echo "HTTPS site: https://$DOMAIN/"
-  if (( SHARED_TLS == 1 )); then
+  if (( MANAGED_TLS == 1 )); then
+    echo 'Managed TLS: automatic refresh via telemtproxy-certificate-client.timer.'
+    echo 'Status: python3 /usr/local/lib/telemtproxy/certificate-client.py status'
+  elif (( SHARED_TLS == 1 )); then
     echo 'Nginx: 127.0.0.1:8443; TLS renewal is managed externally.'
     echo 'Update /etc/telemtproxy/shared-tls/{fullchain.pem,privkey.pem} and reload Nginx after validation.'
   else
