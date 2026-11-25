@@ -10,6 +10,7 @@ TEMP_EDGE_HELPER=""
 TEMP_EDGE_CIDRS=""
 EDGE_MODE=0
 SELFSTEAL_MODE=0
+RESUME_SELFSTEAL=0
 SYNLIMIT=0
 SYNLIMIT_LINE=""
 SYN_MODE_EXPLICIT=0
@@ -54,6 +55,7 @@ Options:
   --synfix              Use external MEKOPR SYN FIX v3 instead of built-in limiting
   --selfsteal           MTProto + own Nginx HTTPS runner site, without WEB Proxy
   --nginx               Alias for --selfsteal
+  --resume-selfsteal    Resume managed TLS install stopped before Nginx configuration
   --cert-manager URL   HTTPS origin of certificate manager (with --selfsteal)
   --cert-token KEY     Per-node access key (omit for hidden prompt)
   --tls-cert FILE       Existing trusted TLS fullchain (with --selfsteal)
@@ -95,6 +97,10 @@ while (($# > 0)); do
         --synlimit) SYNLIMIT=1; SYNLIMIT_LINE='synlimit = "iptables"' ;;
         --synfix) SYNFIX=1 ;;
       esac
+      shift
+      ;;
+    --resume-selfsteal)
+      RESUME_SELFSTEAL=1
       shift
       ;;
     --selfsteal|--nginx)
@@ -178,6 +184,10 @@ if [[ -n "$TLS_CERT$TLS_KEY" ]]; then
     exit 1
   fi
   SHARED_TLS=1
+fi
+if (( RESUME_SELFSTEAL == 1 && MANAGED_TLS != 1 )); then
+  echo '--resume-selfsteal requires --selfsteal and --cert-manager.' >&2
+  exit 1
 fi
 if (( EDGE_MODE == 1 )); then
   if (( SYN_MODE_EXPLICIT == 1 && ( SYNLIMIT == 1 || SYNFIX == 1 ) )); then
@@ -275,8 +285,51 @@ if (( SELFSTEAL_MODE == 1 )); then
       exit 1
     fi
   done
-  if command -v nginx >/dev/null 2>&1 || [[ -e /etc/nginx/sites-available/default || -e /var/www/telemtproxy || -L /var/www/telemtproxy ]]; then
+  if (( RESUME_SELFSTEAL == 1 )); then
+    # Legacy managed-TLS installations can fail after creating the site but
+    # before configuring Nginx. Only accept that exact, unconfigured state.
+    if command -v telemt >/dev/null 2>&1 ||
+       [[ "$(systemctl show -p LoadState --value telemt.service)" != not-found ]] ||
+       [[ "$(systemctl show -p ActiveState --value nginx.service)" != inactive ]] ||
+       ! command -v nginx >/dev/null 2>&1; then
+      echo 'Cannot resume: expected stopped Nginx and no installed Telemt.' >&2; exit 1
+    fi
+    if ! NGINX_VERIFY="$(dpkg --verify nginx-common)" || [[ -n "$NGINX_VERIFY" ]]; then
+      echo 'Cannot resume: package Nginx files differ from their original state.' >&2; exit 1
+    fi
+    python3 - <<'RESUME_CHECK'
+import pathlib, stat, sys
+def refuse(msg):
+    sys.exit("Cannot resume: " + msg)
+site = pathlib.Path("/var/www/telemtproxy")
+stock = pathlib.Path("/etc/nginx/sites-available/default")
+enabled = pathlib.Path("/etc/nginx/sites-enabled")
+conf = pathlib.Path("/etc/nginx/conf.d")
+if not stock.is_file() or stock.is_symlink():
+    refuse("stock Nginx site missing or symlinked")
+if set(p.name for p in enabled.iterdir()) != {"default"}:
+    refuse("additional Nginx sites detected")
+link = enabled / "default"
+if not link.is_symlink() or link.resolve() != stock:
+    refuse("unexpected Nginx default site")
+if any(conf.iterdir()):
+    refuse("additional Nginx configuration detected")
+if not site.is_dir() or site.is_symlink() or site.stat().st_uid != 0:
+    refuse("expected root-owned runner site")
+if set(p.name for p in site.iterdir()) != {"index.html", "style.css", "game.js", "favicon.svg"}:
+    refuse("unexpected site files")
+for p in site.iterdir():
+    st = p.lstat()
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != 0 or not st.st_size or st.st_mode & 0o022:
+        refuse("unsafe runner asset")
+html = (site / "index.html").read_text()
+if "game.js?v=" not in html or "style.css?v=" not in html or "<title>" not in html:
+    refuse("expected generated runner site")
+print("[RESUME] Existing runner site and stock Nginx verified.")
+RESUME_CHECK
+  elif command -v nginx >/dev/null 2>&1 || [[ -e /etc/nginx/sites-available/default || -e /var/www/telemtproxy || -L /var/www/telemtproxy ]]; then
     echo 'Existing Nginx/site detected. --selfsteal is for a fresh VPS.' >&2
+    echo 'If managed TLS retrieval failed before Nginx configuration, use --resume-selfsteal.' >&2
     exit 1
   fi
 fi
@@ -375,7 +428,28 @@ else
   echo '[INFO] No sponsor ad_tag selected.'
 fi
 
+# Validate the access key before installing packages or creating a site.
+if (( MANAGED_TLS == 1 )); then
+  if [[ -e /etc/telemtproxy/certificate-client.json || -L /etc/telemtproxy/certificate-client.json ]]; then
+    if [[ -n "$CERT_TOKEN" ]]; then
+      echo 'Existing certificate client configuration; omit --cert-token to reuse it.' >&2; exit 1
+    fi
+  elif [[ -z "$CERT_TOKEN" ]]; then
+    if ! { : </dev/tty; } 2>/dev/null; then
+      echo 'Certificate access key required: use --cert-token or an interactive terminal.' >&2; exit 1
+    fi
+    if ! IFS= read -r -s -p 'Certificate access key (hidden): ' CERT_TOKEN </dev/tty; then
+      printf '\n'; echo 'Failed to read certificate access key.' >&2; exit 1
+    fi
+    printf '\n'
+    if [[ ! "$CERT_TOKEN" =~ ^[A-Za-z0-9_-]{43}$ ]]; then
+      echo 'Invalid certificate access key: expected exactly 43 base64url characters (A-Z, a-z, 0-9, _, -).' >&2
+      exit 1
+    fi
+  fi
+fi
 if (( SELFSTEAL_MODE == 1 )); then
+  if (( RESUME_SELFSTEAL == 0 )); then
   echo '[SELFSTEAL] Installing Nginx and Certbot for the local HTTPS site...'
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
@@ -580,6 +654,9 @@ print('[OK] Asset size:',sum((public/n).stat().st_size for n in needed),'bytes')
 PY
   rm -f "$SITE_ZIP"
   SITE_ZIP=""
+  else
+    echo '[RESUME] Keeping installed Nginx and existing runner site; retrying managed TLS.'
+  fi
   if (( MANAGED_TLS == 1 )); then
     echo '[SELFSTEAL] Retrieving centrally managed certificate.'
     install -d -m 755 /usr/local/lib/telemtproxy
