@@ -10,8 +10,10 @@ TEMP_EDGE_HELPER=""
 TEMP_EDGE_CIDRS=""
 EDGE_MODE=0
 SELFSTEAL_MODE=0
-SYNLIMIT=0
-SYNLIMIT_LINE=""
+SYNLIMIT=1
+SYNLIMIT_LINE='synlimit = "iptables"'
+SYN_MODE_EXPLICIT=0
+SYNFIX=0
 MASK_PORT=8443
 MASK_SETTINGS=""
 TLS_CERT=""
@@ -47,7 +49,9 @@ usage() {
 Usage: sudo bash deploy-mtproto.sh [DOMAIN] [OPTIONS]
 
 Options:
-  --synlimit            Enable built-in Telemt SYN limiting (iptables; replaces external SYN FIX)
+  --synlimit            Enable built-in Telemt SYN limiting (default for direct installs)
+  --no-synlimit         Disable both SYN filters
+  --synfix              Use external MEKOPR SYN FIX v3 instead of built-in limiting
   --selfsteal           MTProto + own Nginx HTTPS runner site, without WEB Proxy
   --nginx               Alias for --selfsteal
   --cert-manager URL   HTTPS origin of certificate manager (with --selfsteal)
@@ -79,9 +83,18 @@ while (($# > 0)); do
       usage
       exit 0
       ;;
-    --synlimit)
-      SYNLIMIT=1
-      SYNLIMIT_LINE='synlimit = "iptables"'
+    --synlimit|--no-synlimit|--synfix)
+      if (( SYN_MODE_EXPLICIT == 1 )); then
+        echo 'Specify only one SYN filter option.' >&2; exit 1
+      fi
+      SYN_MODE_EXPLICIT=1
+      SYNLIMIT=0
+      SYNFIX=0
+      SYNLIMIT_LINE=""
+      case "$1" in
+        --synlimit) SYNLIMIT=1; SYNLIMIT_LINE='synlimit = "iptables"' ;;
+        --synfix) SYNFIX=1 ;;
+      esac
       shift
       ;;
     --selfsteal|--nginx)
@@ -166,8 +179,12 @@ if [[ -n "$TLS_CERT$TLS_KEY" ]]; then
   fi
   SHARED_TLS=1
 fi
-if (( SYNLIMIT == 1 && EDGE_MODE == 1 )); then
-  echo '--synlimit is not supported with --edge-proxy (shared Edge source IPs).' >&2; exit 1
+if (( EDGE_MODE == 1 )); then
+  if (( SYN_MODE_EXPLICIT == 1 && ( SYNLIMIT == 1 || SYNFIX == 1 ) )); then
+    echo 'SYN filters are not supported with --edge-proxy (shared Edge source IPs).' >&2; exit 1
+  fi
+  SYNLIMIT=0
+  SYNLIMIT_LINE=""
 fi
 if (( SELFSTEAL_MODE == 1 && EDGE_MODE == 1 )); then
   echo '--selfsteal cannot be combined with --edge-proxy.' >&2
@@ -647,9 +664,12 @@ elif (( SYNLIMIT == 1 )); then
   DEBIAN_FRONTEND=noninteractive apt-get update
   DEBIAN_FRONTEND=noninteractive apt-get install -y iptables
   FIX_ARGS=(-no-fix)
-else
+elif (( SYNFIX == 1 )); then
   echo '[2/5] Installing Telemt (latest stable) and MEKOPR SYN FIX v3...'
   FIX_ARGS=(-fix -fix-type v3)
+else
+  echo '[2/5] Installing Telemt without SYN filters...'
+  FIX_ARGS=(-no-fix)
 fi
 TEMP_INSTALLER="$(mktemp)"
 curl -fsSL --retry 3 --max-time 30 \
