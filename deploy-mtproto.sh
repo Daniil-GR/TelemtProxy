@@ -10,8 +10,8 @@ TEMP_EDGE_HELPER=""
 TEMP_EDGE_CIDRS=""
 EDGE_MODE=0
 SELFSTEAL_MODE=0
-SYNLIMIT=1
-SYNLIMIT_LINE='synlimit = "iptables"'
+SYNLIMIT=0
+SYNLIMIT_LINE=""
 SYN_MODE_EXPLICIT=0
 SYNFIX=0
 MASK_PORT=8443
@@ -49,8 +49,8 @@ usage() {
 Usage: sudo bash deploy-mtproto.sh [DOMAIN] [OPTIONS]
 
 Options:
-  --synlimit            Enable built-in Telemt SYN limiting (default for direct installs)
-  --no-synlimit         Disable both SYN filters
+  --synlimit            Enable built-in Telemt SYN limiting (opt-in)
+  --no-synlimit         Disable both SYN filters (default)
   --synfix              Use external MEKOPR SYN FIX v3 instead of built-in limiting
   --selfsteal           MTProto + own Nginx HTTPS runner site, without WEB Proxy
   --nginx               Alias for --selfsteal
