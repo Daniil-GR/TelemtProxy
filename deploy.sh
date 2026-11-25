@@ -24,6 +24,7 @@ Usage: sudo bash deploy.sh [DOMAIN] [OPTIONS]
 
 Options:
   --domain FQDN          Domain for WEB proxy (or positional DOMAIN)
+  --synlimit            Enable built-in Telemt SYN limiting (iptables; replaces external SYN FIX)
   --resume               Continue a first installation interrupted at the MEKOPR menu step
   --hello-secret HEX     Reuse hello secret (32 HEX, without dd/ee)
   --hello HEX            Alias for --hello-secret
@@ -50,6 +51,8 @@ HELLO_FLAG_SET=0
 AD_TAG_FLAG_SET=0
 CDN_MODE=0
 RESUME_MODE=0
+SYNLIMIT=0
+SYNLIMIT_LINE=""
 ORIGIN_CERT=""
 ORIGIN_KEY=""
 WILDCARD_CERT=""
@@ -60,6 +63,11 @@ while (( $# )); do
   case "$1" in
     --wildcard)
       AUTO_WILDCARD=1; shift
+      ;;
+    --synlimit)
+      SYNLIMIT=1
+      SYNLIMIT_LINE='synlimit = "iptables"'
+      shift
       ;;
     --resume)
       RESUME_MODE=1
@@ -124,6 +132,9 @@ while (( $# )); do
       ;;
   esac
 done
+if (( SYNLIMIT == 1 && RESUME_MODE == 1 )); then
+  echo '--synlimit is not supported with --resume (existing SYN FIX).' >&2; exit 1
+fi
 if (( AUTO_WILDCARD == 1 )); then
   if (( CDN_MODE == 1 )) || [[ -n "$WILDCARD_CERT$WILDCARD_KEY$ORIGIN_CERT$ORIGIN_KEY" ]]; then
     echo '--wildcard cannot be combined with CDN or supplied certificate flags.' >&2; exit 1
@@ -533,12 +544,17 @@ install -d -m 755 /var/lib/telemt/public
 echo '[OK] WEB static directory prepared before MEKOPR starts Telemt.'
 INSTALL_SCRIPT="$(mktemp)"
 curl -fsSL --retry 3 https://raw.githubusercontent.com/Mekotofeuka/MTPROTO_FIX_By_MEKO/main/install.sh -o "$INSTALL_SCRIPT"
-# MEKOPR manages Telemt and SYN FIX on 9443. We configure Nginx separately,
+FIX_ARGS=(-fix -fix-type v3)
+if (( SYNLIMIT == 1 )); then
+  apt-get install -y -qq iptables
+  FIX_ARGS=(-no-fix)
+fi
+# MEKOPR manages Telemt and optional SYN FIX on 9443. We configure Nginx separately,
 # because MEKOPR's install.sh has been observed to ignore failed nginx restarts.
 bash "$INSTALL_SCRIPT" \
   -telemt -domain "$DOMAIN" -port 9443 -version latest \
   -web -web-host "$DOMAIN" -web-user hello -web-secret "$SECRET" \
-  -fix -fix-type v3
+  "${FIX_ARGS[@]}"
 rm -f "$INSTALL_SCRIPT"
 
 echo "[2b/8] Fixing MEKOPR WEB-link menu (S option)..."
@@ -635,6 +651,7 @@ hello = "$SECRET"
 [[server.listeners]]
 ip = "0.0.0.0"
 port = 9443
+$SYNLIMIT_LINE
 
 [[server.listeners]]
 ip = "127.0.0.1"
@@ -789,6 +806,97 @@ systemctl enable --now nginx
 systemctl is-active --quiet nginx || { echo 'Nginx failed to start.' >&2; exit 1; }
 # Our HTTPS site is configured; preserve it even if a later check fails.
 INSTALLER_NGINX_CLEANUP=0
+
+# Match MEKOPR's Basic optimization profile, preserving its rollback layout.
+# Apply after the final Telemt configuration (including any Edge settings) is written.
+if (( SYNLIMIT == 1 )); then
+  # Telemt owns its firewall rules and needs CAP_NET_ADMIN at startup.
+  install -d -m 755 /etc/systemd/system/telemt.service.d
+  cat > /etc/systemd/system/telemt.service.d/20-telemtproxy-synlimit.conf <<'SYNUNIT'
+[Service]
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+SYNUNIT
+  echo '[INFO] Built-in Telemt SYN limit enabled (iptables).'
+else
+  echo '[INFO] Built-in Telemt SYN limit disabled.'
+fi
+
+echo '[OPT] Applying MEKOPR basic optimization...'
+(
+  set -Eeuo pipefail
+  umask 077
+  snapshot=/opt/mtpr-simple/opt-snapshot
+  cfg=/etc/telemt/telemt.toml
+  sysctl_file=/etc/sysctl.d/99-custom.conf
+  limits=/etc/systemd/system/telemt.service.d/limits.conf
+  if [[ -e "$snapshot" || -L "$snapshot" ]]; then
+    echo '[ERROR] Existing MEKOPR optimization snapshot; refusing to overwrite it.' >&2
+    exit 1
+  fi
+  install -d -m 700 "$snapshot"
+  if [[ -f "$sysctl_file" ]]; then
+    cp -a "$sysctl_file" "$snapshot/sysctl.conf"
+  else
+    touch "$snapshot/sysctl.absent"
+  fi
+  if [[ -f "$limits" ]]; then
+    cp -a "$limits" "$snapshot/limits.conf"
+  else
+    touch "$snapshot/limits.absent"
+  fi
+  install -m 600 "$cfg" "$snapshot/telemt.toml"
+  printf '%s\n' "$cfg" > "$snapshot/telemt.path"
+  date '+%Y-%m-%d %H:%M:%S' > "$snapshot/created_at"
+  python3 - "$cfg" <<'BASIC_OPT'
+import pathlib, re, sys, tomllib
+p = pathlib.Path(sys.argv[1])
+s = p.read_text()
+c = tomllib.loads(s)
+if "max_connections" in c["server"]:
+    s, count = re.subn(r"(?m)^max_connections[ \t]*=.*$", "max_connections = 16384", s)
+    assert count == 1
+else:
+    s, count = re.subn(r"(?m)^\[server\][ \t]*$", "[server]\nmax_connections = 16384", s)
+    assert count == 1
+# The upstream menu updates client_handshake only if already present.
+s = re.sub(r"(?m)^client_handshake[ \t]*=.*$", "client_handshake = 15", s)
+assert tomllib.loads(s)["server"]["max_connections"] == 16384
+p.write_text(s)
+BASIC_OPT
+  install -d -m 755 /etc/systemd/system/telemt.service.d
+  cat > "$limits" <<'OPT_LIMITS'
+[Service]
+LimitNOFILE=65535
+OPT_LIMITS
+  chmod 644 "$limits"
+  cat > "$sysctl_file" <<'OPT_SYSCTL'
+net.ipv4.tcp_fastopen=3
+net.core.somaxconn=65535
+net.ipv4.tcp_max_syn_backlog=65535
+net.core.netdev_max_backlog=65535
+fs.file-max=2097152
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.ipv4.tcp_keepalive_time=45
+net.ipv4.tcp_keepalive_intvl=15
+net.ipv4.tcp_keepalive_probes=3
+OPT_SYSCTL
+  chmod 644 "$sysctl_file"
+  modprobe tcp_bbr 2>/dev/null || true
+  # Do not reapply unrelated sysctl configuration on the host.
+  if ! sysctl -p "$sysctl_file"; then
+    echo '[WARN] Kernel refused one or more basic optimization settings; review output.' >&2
+  fi
+  systemctl daemon-reload
+  if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)" == bbr &&
+        "$(sysctl -n net.core.default_qdisc 2>/dev/null || true)" == fq &&
+        "$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null || true)" == 3 ]]; then
+    echo '[OK] Basic optimization applied: BBR, fq, TCP Fast Open.'
+  else
+    echo '[WARN] Basic optimization only partially applied; kernel settings differ.' >&2
+  fi
+)
 
 echo '[7/8] Restarting Telemt to load the static-directory snapshot...'
 systemctl enable telemt
