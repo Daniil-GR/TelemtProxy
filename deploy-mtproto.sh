@@ -12,6 +12,9 @@ EDGE_MODE=0
 SELFSTEAL_MODE=0
 MASK_PORT=8443
 MASK_SETTINGS=""
+TLS_CERT=""
+TLS_KEY=""
+SHARED_TLS=0
 SITE_ZIP=""
 EDGE_OWNED_INSTALL=0
 cleanup() {
@@ -41,6 +44,8 @@ Usage: sudo bash deploy-mtproto.sh [DOMAIN] [OPTIONS]
 Options:
   --selfsteal           MTProto + own Nginx HTTPS runner site, without WEB Proxy
   --nginx               Alias for --selfsteal
+  --tls-cert FILE       Existing trusted TLS fullchain (with --selfsteal)
+  --tls-key FILE        Matching private key; renewal managed externally
   --edge-proxy          MTProto for Gcore Edge Proxy (TCP 443, PROXY protocol v1/v2)
   --domain FQDN         Domain for public tg://proxy link (or positional DOMAIN)
   --hello HEX           Reuse existing hello secret (exactly 32 HEX characters)
@@ -74,7 +79,7 @@ while (($# > 0)); do
       EDGE_MODE=1
       shift
       ;;
-    --domain|--hello|--hello-secret|--ad-tag)
+    --domain|--hello|--hello-secret|--ad-tag|--tls-cert|--tls-key)
       option="$1"
       if (($# < 2)); then
         echo "Missing value for $option" >&2
@@ -91,6 +96,14 @@ while (($# > 0)); do
           if [[ -z "$value" ]]; then echo 'Empty hello flag is invalid; omit it for generation.' >&2; exit 1; fi
           SECRET="$value"
           HELLO_FLAG_SET=1
+          ;;
+        --tls-cert)
+          [[ -z "$TLS_CERT" && -n "$value" ]] || { echo 'Invalid or duplicate --tls-cert.' >&2; exit 1; }
+          TLS_CERT="$value"
+          ;;
+        --tls-key)
+          [[ -z "$TLS_KEY" && -n "$value" ]] || { echo 'Invalid or duplicate --tls-key.' >&2; exit 1; }
+          TLS_KEY="$value"
           ;;
         --ad-tag)
           if ((AD_TAG_FLAG_SET)); then echo 'ad_tag specified more than once.' >&2; exit 1; fi
@@ -117,6 +130,13 @@ while (($# > 0)); do
   esac
 done
 
+if [[ -n "$TLS_CERT$TLS_KEY" ]]; then
+  if (( SELFSTEAL_MODE != 1 )) || [[ -z "$TLS_CERT" || -z "$TLS_KEY" ]]; then
+    echo '--tls-cert and --tls-key must be supplied together with --selfsteal.' >&2
+    exit 1
+  fi
+  SHARED_TLS=1
+fi
 if (( SELFSTEAL_MODE == 1 && EDGE_MODE == 1 )); then
   echo '--selfsteal cannot be combined with --edge-proxy.' >&2
   exit 1
@@ -152,6 +172,28 @@ fi
 if [[ "$ID" != ubuntu || "$VERSION_ID" != '24.04' ]]; then
   echo 'Supported OS: Ubuntu 24.04 only.' >&2
   exit 1
+fi
+if (( SHARED_TLS == 1 )); then
+  [[ "$TLS_CERT" == /* && "$TLS_KEY" == /* && -s "$TLS_CERT" && -s "$TLS_KEY" ]] || {
+    echo 'Supply absolute paths to the existing certificate and key.' >&2; exit 1;
+  }
+  command -v openssl >/dev/null || { echo 'Install openssl to validate TLS files.' >&2; exit 1; }
+  python3 - "$TLS_KEY" <<'KEY_CHECK'
+import os, stat, sys
+s = os.stat(sys.argv[1])
+if not stat.S_ISREG(s.st_mode) or s.st_uid != 0 or s.st_mode & 0o077:
+    sys.exit('TLS private key must be root-owned with permissions 600 or stricter.')
+KEY_CHECK
+  openssl x509 -in "$TLS_CERT" -noout -checkend 86400 >/dev/null || {
+    echo 'TLS certificate is invalid or expires within 24 hours.' >&2; exit 1;
+  }
+  openssl verify -purpose sslserver -verify_hostname "$DOMAIN" -untrusted "$TLS_CERT" "$TLS_CERT" >/dev/null || {
+    echo 'TLS certificate chain or hostname validation failed.' >&2; exit 1;
+  }
+  CERT_PUB="$(openssl x509 -in "$TLS_CERT" -noout -pubkey | openssl pkey -pubin -outform DER | openssl dgst -sha256)"
+  KEY_PUB="$(openssl pkey -in "$TLS_KEY" -passin pass: -pubout -outform DER | openssl dgst -sha256)"
+  [[ "$CERT_PUB" == "$KEY_PUB" ]] || { echo 'TLS certificate and key do not match.' >&2; exit 1; }
+  echo '[OK] Existing TLS certificate validated.'
 fi
 if [[ -e /etc/telemt/telemt.toml || -e /opt/mtpr-simple/main.sh ]]; then
   echo 'Existing Telemt/MEKOPR detected. This installer is for a fresh VPS.' >&2
@@ -279,11 +321,15 @@ if (( SELFSTEAL_MODE == 1 )); then
   echo '[SELFSTEAL] Installing Nginx and Certbot for the local HTTPS site...'
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
-  apt-get install -y -qq nginx certbot ca-certificates openssl
+  if (( SHARED_TLS == 1 )); then
+    apt-get install -y -qq nginx ca-certificates openssl
+  else
+    apt-get install -y -qq nginx certbot ca-certificates openssl
+  fi
   # Nginx may be automatically started with its default port 80 server.
   systemctl stop nginx
   if command -v ufw >/dev/null 2>&1 && ufw status | grep -q '^Status: active'; then
-    ufw allow 80/tcp
+    if (( SHARED_TLS == 0 )); then ufw allow 80/tcp; fi
     ufw allow 443/tcp
   fi
   install -d -m 755 /var/www/telemtproxy
@@ -476,15 +522,26 @@ print('[OK] Asset size:',sum((public/n).stat().st_size for n in needed),'bytes')
 PY
   rm -f "$SITE_ZIP"
   SITE_ZIP=""
-  echo '[SELFSTEAL] Obtaining ordinary HTTPS certificate (HTTP-01)...'
-  certbot certonly --standalone --preferred-challenges http -d "$DOMAIN" \
-    --non-interactive --agree-tos --register-unsafely-without-email --keep-until-expiring
+  if (( SHARED_TLS == 1 )); then
+    echo '[SELFSTEAL] Using supplied TLS certificate; no ACME issuance on this VPS.'
+    install -d -m 700 /etc/telemtproxy/shared-tls
+    TLS_CERT_PATH=/etc/telemtproxy/shared-tls/fullchain.pem
+    TLS_KEY_PATH=/etc/telemtproxy/shared-tls/privkey.pem
+    if [[ ! "$TLS_CERT" -ef "$TLS_CERT_PATH" ]]; then install -m 644 "$TLS_CERT" "$TLS_CERT_PATH"; fi
+    if [[ ! "$TLS_KEY" -ef "$TLS_KEY_PATH" ]]; then install -m 600 "$TLS_KEY" "$TLS_KEY_PATH"; fi
+  else
+    echo '[SELFSTEAL] Obtaining ordinary HTTPS certificate (HTTP-01)...'
+    certbot certonly --standalone --preferred-challenges http -d "$DOMAIN" \
+      --non-interactive --agree-tos --register-unsafely-without-email --keep-until-expiring
+    TLS_CERT_PATH="/etc/letsencrypt/live/$DOMAIN/fullchain.pem"
+    TLS_KEY_PATH="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
+  fi
   cat > /etc/nginx/sites-available/default <<EOF
 server {
     listen 127.0.0.1:8443 ssl http2;
     server_name $DOMAIN;
-    ssl_certificate /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
+    ssl_certificate $TLS_CERT_PATH;
+    ssl_certificate_key $TLS_KEY_PATH;
     root /var/www/telemtproxy;
     index index.html;
     access_log off;
@@ -500,6 +557,7 @@ EOF
   nginx -t
   systemctl enable --now nginx
   systemctl is-active --quiet nginx
+  if (( SHARED_TLS == 0 )); then
   # Certbot uses standalone port 80 for renewal; Nginx only listens on loopback.
   # Reload the certificate on successful renewal without restarting Telemt.
   install -d -m 755 /etc/letsencrypt/renewal-hooks/deploy
@@ -511,6 +569,7 @@ systemctl reload nginx
 HOOK
   chmod 755 /etc/letsencrypt/renewal-hooks/deploy/telemtproxy-nginx-reload.sh
   systemctl enable --now certbot.timer
+  fi
   SITE_BODY="$(curl -4 -fsS --noproxy '*' --connect-timeout 5 --max-time 15 \
     --resolve "$DOMAIN:8443:127.0.0.1" "https://$DOMAIN:8443/")"
   if [[ "$SITE_BODY" != *'game.js?v='* || "$SITE_BODY" != *'<title>'* ]]; then
@@ -698,7 +757,12 @@ EOF
 
 if (( SELFSTEAL_MODE == 1 )); then
   echo "HTTPS site: https://$DOMAIN/"
-  echo 'Nginx: 127.0.0.1:8443; Certbot renewal via systemd timer on port 80.'
+  if (( SHARED_TLS == 1 )); then
+    echo 'Nginx: 127.0.0.1:8443; TLS renewal is managed externally.'
+    echo 'Update /etc/telemtproxy/shared-tls/{fullchain.pem,privkey.pem} and reload Nginx after validation.'
+  else
+    echo 'Nginx: 127.0.0.1:8443; Certbot renewal via systemd timer on port 80.'
+  fi
   echo 'Verify actual MTProto connectivity in Telegram using the generated ee link.'
 else
   echo 'No Nginx or Certbot configured.'
