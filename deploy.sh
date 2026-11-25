@@ -845,7 +845,8 @@ echo '[OPT] Applying MEKOPR basic optimization...'
   else
     touch "$snapshot/limits.absent"
   fi
-  install -m 600 "$cfg" "$snapshot/telemt.toml"
+  # Preserve root:telemt and mode 640 for MEKOPR rollback; directory is root-only.
+  cp -a "$cfg" "$snapshot/telemt.toml"
   printf '%s\n' "$cfg" > "$snapshot/telemt.path"
   date '+%Y-%m-%d %H:%M:%S' > "$snapshot/created_at"
   python3 - "$cfg" <<'BASIC_OPT'
